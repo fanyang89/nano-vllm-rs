@@ -6,7 +6,7 @@ use nano_vllm_rs::{LLMEngine, RuntimeDevice, SamplingParams};
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum CliDevice {
     Cpu,
-    Cuda,
+    Rocm,
 }
 
 #[derive(Parser)]
@@ -68,7 +68,7 @@ fn main() -> Result<()> {
     println!("Loading model from: {}", args.model);
     let runtime_device = match args.device {
         CliDevice::Cpu => RuntimeDevice::Cpu,
-        CliDevice::Cuda => RuntimeDevice::Cuda,
+        CliDevice::Rocm => RuntimeDevice::Rocm,
     };
     let mut engine = LLMEngine::new(&args.model, runtime_device)?;
 

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use anyhow::Result;
-use candle_core::Device;
+use burn_dispatch::DispatchDevice;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Deserialize;
 
@@ -20,7 +20,7 @@ pub struct GenerationOutput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeDevice {
     Cpu,
-    Cuda,
+    Rocm,
 }
 
 pub struct LLMEngine {
@@ -220,21 +220,29 @@ impl LLMEngine {
     }
 }
 
-fn create_device(runtime_device: RuntimeDevice) -> Result<Device> {
+fn create_device(runtime_device: RuntimeDevice) -> Result<DispatchDevice> {
     match runtime_device {
-        RuntimeDevice::Cpu => Ok(Device::Cpu),
-        RuntimeDevice::Cuda => create_cuda_device(),
+        RuntimeDevice::Cpu => create_cpu_device(),
+        RuntimeDevice::Rocm => create_rocm_device(),
     }
 }
 
-#[cfg(feature = "cuda")]
-fn create_cuda_device() -> Result<Device> {
-    Device::new_cuda(0).map_err(|e| anyhow::anyhow!("failed to initialize CUDA device 0: {e}"))
+#[cfg(feature = "cpu")]
+fn create_cpu_device() -> Result<DispatchDevice> {
+    Ok(DispatchDevice::NdArray(burn_ndarray::NdArrayDevice::Cpu))
 }
 
-#[cfg(not(feature = "cuda"))]
-fn create_cuda_device() -> Result<Device> {
-    anyhow::bail!(
-        "CUDA requested but this binary was built without CUDA support. Rebuild with `--features cuda`."
-    )
+#[cfg(not(feature = "cpu"))]
+fn create_cpu_device() -> Result<DispatchDevice> {
+    anyhow::bail!("CPU requested but this binary was built without `cpu` feature support")
+}
+
+#[cfg(feature = "rocm")]
+fn create_rocm_device() -> Result<DispatchDevice> {
+    Ok(DispatchDevice::Rocm(burn_rocm::RocmDevice::default()))
+}
+
+#[cfg(not(feature = "rocm"))]
+fn create_rocm_device() -> Result<DispatchDevice> {
+    anyhow::bail!("ROCm requested but this binary was built without `rocm` feature support")
 }
