@@ -16,3 +16,30 @@ tasks:
       OUT: ./models/Qwen3-0.6B/weights-map.json
     cmds:
       - cargo run --release -- convert-model --model {{.MODEL}} --out {{.OUT}}
+
+  run-rocm:
+    desc: Run inference on ROCm with cubecl hipconfig shim
+    vars:
+      MODEL: ./models/Qwen3-0.6B
+      PROMPT: "Hello"
+      HIP_PATH: /opt/rocm-7.2.0
+      HIPSIM_DIR: /tmp/hipshim
+      ROCM_TARGET_DIR: target/rocm
+    env:
+      HIP_PATH: "{{.HIP_PATH}}"
+      CARGO_TARGET_DIR: "{{.ROCM_TARGET_DIR}}"
+      PATH: "{{.HIPSIM_DIR}}:{{env \"PATH\"}}"
+    cmds:
+      - mkdir -p {{.HIPSIM_DIR}}
+      - |
+        cat > {{.HIPSIM_DIR}}/hipconfig <<'SHIM'
+        #!/usr/bin/env bash
+        case "$1" in
+          --version) echo "7.2.52802-fc0010cf6a" ;;
+          -R) echo "{{.HIP_PATH}}" ;;
+          -p) echo "{{.HIP_PATH}}" ;;
+          *) /usr/bin/hipconfig "$@" ;;
+        esac
+        SHIM
+      - chmod +x {{.HIPSIM_DIR}}/hipconfig
+      - cargo run --release --features rocm -- run --model {{.MODEL}} --device rocm --prompt "{{.PROMPT}}"
