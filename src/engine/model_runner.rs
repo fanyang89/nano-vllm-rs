@@ -14,16 +14,22 @@ pub struct ModelRunner {
     v_caches: Vec<Tensor>,
     block_size: usize,
     device: Device,
-    dtype: DType,
 }
 
 impl ModelRunner {
+    fn select_dtype(device: &Device) -> DType {
+        match device {
+            Device::Cpu => DType::F32,
+            _ => DType::BF16,
+        }
+    }
+
     pub fn new(
         engine_config: &mut EngineConfig,
         model_config: &ModelConfig,
         device: Device,
     ) -> Result<Self> {
-        let dtype = DType::BF16;
+        let dtype = Self::select_dtype(&device);
         let model_path = &engine_config.model_path;
 
         // Load model weights from safetensors
@@ -50,7 +56,6 @@ impl ModelRunner {
             v_caches,
             block_size: engine_config.kvcache_block_size,
             device,
-            dtype,
         })
     }
 

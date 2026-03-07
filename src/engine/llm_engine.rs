@@ -136,7 +136,7 @@ impl LLMEngine {
 
             if let Some(pb) = &pb {
                 pb.set_message(format!(
-                    "Prefill: {:.0}tok/s  Decode: {:.0}tok/s",
+                    "Prefill: {:.0} tok/s  Decode: {:.0} tok/s",
                     prefill_tps, decode_tps
                 ));
             }

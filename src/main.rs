@@ -25,6 +25,10 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "Warning: debug build is slow for inference. Use `cargo run --release -- ...` for real performance."
+    );
 
     let prompts: Vec<&str> = if args.prompt.is_empty() {
         vec!["Hello, world!"]
