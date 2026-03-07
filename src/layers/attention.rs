@@ -1,6 +1,6 @@
 use anyhow::{Result, ensure};
 use burn::tensor::activation::softmax;
-use burn::tensor::{IndexingUpdateOp, Int, Tensor, TensorData};
+use burn::tensor::{IndexingUpdateOp, Int, Tensor};
 use burn_dispatch::Dispatch;
 
 use crate::utils::context::AttentionContext;
@@ -260,13 +260,16 @@ fn store_kvcache(
 }
 
 fn create_causal_mask(q_len: usize, kv_len: usize, device: &burn_dispatch::DispatchDevice) -> Tensor<Dispatch, 3> {
-    let offset = kv_len as i64 - q_len as i64;
-    let mut mask_data = vec![0.0f32; q_len * kv_len];
-    for qi in 0..q_len {
-        let max_kv = (offset + qi as i64 + 1) as usize;
-        for kj in max_kv..kv_len {
-            mask_data[qi * kv_len + kj] = f32::NEG_INFINITY;
-        }
-    }
-    Tensor::<Dispatch, 3>::from_data(TensorData::new(mask_data, [1, q_len, kv_len]), device)
+    let offset = (kv_len as i64 - q_len as i64) as i32;
+    let q_idx = Tensor::<Dispatch, 1, Int>::arange(0..q_len as i64, device)
+        .reshape([q_len, 1])
+        .repeat(&[1, kv_len]);
+    let k_idx = Tensor::<Dispatch, 1, Int>::arange(0..kv_len as i64, device)
+        .reshape([1, kv_len])
+        .repeat(&[q_len, 1]);
+
+    let allowed = k_idx.lower_equal(q_idx.add_scalar(offset));
+    let mask = Tensor::<Dispatch, 2>::zeros([q_len, kv_len], device)
+        .mask_fill(allowed.bool_not(), f32::NEG_INFINITY);
+    mask.unsqueeze_dim::<3>(0)
 }
