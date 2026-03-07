@@ -25,6 +25,10 @@ struct Args {
     /// Repeat each prompt N times to increase decode batch concurrency
     #[arg(long, default_value_t = 1)]
     repeat_prompt: usize,
+
+    /// Disable random sampling and use greedy decoding (argmax)
+    #[arg(long, default_value_t = false)]
+    greedy: bool,
 }
 
 fn main() -> Result<()> {
@@ -46,7 +50,12 @@ fn main() -> Result<()> {
         .collect();
     let prompts: Vec<&str> = expanded_prompts.iter().map(|s| s.as_str()).collect();
 
-    let sampling_params = SamplingParams::new(args.temperature, args.max_tokens, false);
+    let sampling_params = SamplingParams::new(
+        args.temperature,
+        args.max_tokens,
+        false,
+        !args.greedy,
+    );
 
     tracing_subscriber::fmt::init();
 

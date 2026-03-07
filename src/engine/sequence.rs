@@ -23,6 +23,7 @@ pub struct Sequence {
     pub temperature: f32,
     pub max_tokens: usize,
     pub ignore_eos: bool,
+    pub do_sample: bool,
     block_size: usize,
 }
 
@@ -40,6 +41,7 @@ impl Sequence {
             temperature: sampling_params.temperature,
             max_tokens: sampling_params.max_tokens,
             ignore_eos: sampling_params.ignore_eos,
+            do_sample: sampling_params.do_sample,
             block_size,
         }
     }

@@ -263,7 +263,9 @@ impl ModelRunner {
         )?;
 
         let logits = self.model.compute_logits(&hidden_states, &ctx)?;
-        let token_ids = sampler::sample(&logits, &temperatures)?;
+        let do_sample = seqs.first().is_none_or(|s| s.do_sample);
+        debug_assert!(seqs.iter().all(|s| s.do_sample == do_sample));
+        let token_ids = sampler::sample(&logits, &temperatures, do_sample)?;
 
         Ok(token_ids)
     }
