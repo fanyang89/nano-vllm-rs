@@ -163,6 +163,7 @@ impl LLMEngine {
         let mut outputs: HashMap<usize, Vec<u32>> = HashMap::new();
         let mut prefill_tps = 0.0f64;
         let mut decode_tps = 0.0f64;
+        let mut last_pb_update = Instant::now();
 
         while !self.scheduler.is_finished() {
             let t = Instant::now();
@@ -183,10 +184,13 @@ impl LLMEngine {
             }
 
             if let Some(pb) = &pb {
-                pb.set_message(format!(
-                    "Prefill: {:.0} tok/s  Decode: {:.0} tok/s",
-                    prefill_tps, decode_tps
-                ));
+                if last_pb_update.elapsed().as_millis() >= 100 {
+                    pb.set_message(format!(
+                        "Prefill: {:.0} tok/s  Decode: {:.0} tok/s",
+                        prefill_tps, decode_tps
+                    ));
+                    last_pb_update = Instant::now();
+                }
             }
         }
 
