@@ -5,3 +5,6 @@ pub mod engine;
 pub mod layers;
 pub mod model;
 pub mod utils;
+
+pub use engine::llm_engine::{GenerationOutput, LLMEngine};
+pub use sampling_params::SamplingParams;
