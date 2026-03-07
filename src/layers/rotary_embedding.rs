@@ -36,49 +36,39 @@ impl RotaryEmbedding {
         ensure!(q_shape[2] == self.head_dim && k_shape[2] == self.head_dim, "head_dim mismatch");
 
         let n = q_shape[0];
-        let qh = q_shape[1];
-        let kh = k_shape[1];
         let hd = self.head_dim;
         let half = hd / 2;
-
-        let pos = positions.to_data().to_vec::<i32>()?;
-        ensure!(pos.len() == n, "positions length mismatch");
-
-        let q_data = q.to_data().to_vec::<f32>()?;
-        let k_data = k.to_data().to_vec::<f32>()?;
-        let mut q_out = q_data.clone();
-        let mut k_out = k_data.clone();
-
-        for t in 0..n {
-            let p = pos[t].max(0) as usize;
-            let p = p.min(self.max_position_embeddings.saturating_sub(1)) as f64;
-            for i in 0..half {
-                let inv_freq = 1.0f64 / self.rope_theta.powf((2.0 * i as f64) / hd as f64);
-                let angle = p * inv_freq;
-                let cos = angle.cos() as f32;
-                let sin = angle.sin() as f32;
-
-                for h in 0..qh {
-                    let base = (t * qh + h) * hd;
-                    let x1 = q_data[base + i];
-                    let x2 = q_data[base + i + half];
-                    q_out[base + i] = x1 * cos - x2 * sin;
-                    q_out[base + i + half] = x2 * cos + x1 * sin;
-                }
-                for h in 0..kh {
-                    let base = (t * kh + h) * hd;
-                    let x1 = k_data[base + i];
-                    let x2 = k_data[base + i + half];
-                    k_out[base + i] = x1 * cos - x2 * sin;
-                    k_out[base + i + half] = x2 * cos + x1 * sin;
-                }
-            }
-        }
-
         let device = q.device();
-        Ok((
-            Tensor::<Dispatch, 3>::from_data(TensorData::new(q_out, [n, qh, hd]), &device),
-            Tensor::<Dispatch, 3>::from_data(TensorData::new(k_out, [n, kh, hd]), &device),
-        ))
+        let inv_freq: Vec<f32> = (0..half)
+            .map(|i| {
+                let denom = self.rope_theta.powf((2.0 * i as f64) / hd as f64);
+                (1.0 / denom) as f32
+            })
+            .collect();
+        let inv_freq = Tensor::<Dispatch, 1>::from_data(TensorData::new(inv_freq, [half]), &device);
+
+        // Clamp positions to configured max range before angle construction.
+        let pos = positions
+            .clone()
+            .clamp(0, self.max_position_embeddings.saturating_sub(1) as i32)
+            .float()
+            .reshape([n, 1]);
+        let angles = pos.matmul(inv_freq.unsqueeze_dim::<2>(0)); // [n, half]
+        let cos = angles.clone().cos().unsqueeze_dim::<3>(1); // [n,1,half]
+        let sin = angles.sin().unsqueeze_dim::<3>(1); // [n,1,half]
+
+        let q1 = q.clone().slice([0..n, 0..q_shape[1], 0..half]);
+        let q2 = q.clone().slice([0..n, 0..q_shape[1], half..hd]);
+        let k1 = k.clone().slice([0..n, 0..k_shape[1], 0..half]);
+        let k2 = k.clone().slice([0..n, 0..k_shape[1], half..hd]);
+
+        let q_rot_1 = q1.clone() * cos.clone() - q2.clone() * sin.clone();
+        let q_rot_2 = q2 * cos.clone() + q1 * sin.clone();
+        let k_rot_1 = k1.clone() * cos.clone() - k2.clone() * sin.clone();
+        let k_rot_2 = k2 * cos + k1 * sin;
+
+        let q_out = Tensor::<Dispatch, 3>::cat(vec![q_rot_1, q_rot_2], 2);
+        let k_out = Tensor::<Dispatch, 3>::cat(vec![k_rot_1, k_rot_2], 2);
+        Ok((q_out, k_out))
     }
 }

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow, ensure};
+use burn::tensor::activation::silu;
 use burn::tensor::{Int, Tensor, TensorData};
 use burn_dispatch::{Dispatch, DispatchDevice};
 use safetensors::{Dtype, SafeTensors, tensor::TensorView};
@@ -239,59 +240,36 @@ fn rms_norm_2d(x: &Tensor<Dispatch, 2>, weight: &Tensor<Dispatch, 1>, eps: f64) 
     let shape = x.shape();
     let dims = shape.as_slice();
     ensure!(dims.len() == 2, "rms_norm_2d expects rank-2");
-    let n = dims[0];
     let h = dims[1];
     ensure!(weight.shape().as_slice() == [h], "rms_norm_2d weight mismatch");
-
-    let device = x.device();
-    let x_data = x.to_data().to_vec::<f32>()?;
-    let w = weight.to_data().to_vec::<f32>()?;
-    let mut out = vec![0f32; x_data.len()];
-
-    for i in 0..n {
-        let row = &x_data[i * h..(i + 1) * h];
-        let ms = row.iter().map(|v| v * v).sum::<f32>() / h as f32;
-        let inv = 1.0f32 / (ms + eps as f32).sqrt();
-        for j in 0..h {
-            out[i * h + j] = row[j] * inv * w[j];
-        }
-    }
-
-    Ok(Tensor::<Dispatch, 2>::from_data(
-        TensorData::new(out, [n, h]),
-        &device,
-    ))
+    let inv = x
+        .clone()
+        .powf_scalar(2.0)
+        .mean_dim(1)
+        .add_scalar(eps as f32)
+        .sqrt()
+        .recip();
+    let w = weight.clone().unsqueeze_dim::<2>(0);
+    Ok(x.clone() * inv * w)
 }
 
 fn rms_norm_3d(x: &Tensor<Dispatch, 3>, weight: &Tensor<Dispatch, 1>, eps: f64) -> Result<Tensor<Dispatch, 3>> {
     let dims = x.shape().as_slice().to_vec();
     ensure!(dims.len() == 3, "rms_norm_3d expects rank-3");
-    let n = dims[0];
-    let h = dims[1];
     let d = dims[2];
     ensure!(weight.shape().as_slice() == [d], "rms_norm_3d weight mismatch");
-
-    let device = x.device();
-    let x_data = x.to_data().to_vec::<f32>()?;
-    let w = weight.to_data().to_vec::<f32>()?;
-    let mut out = vec![0f32; x_data.len()];
-
-    for i in 0..n {
-        for j in 0..h {
-            let base = (i * h + j) * d;
-            let row = &x_data[base..base + d];
-            let ms = row.iter().map(|v| v * v).sum::<f32>() / d as f32;
-            let inv = 1.0f32 / (ms + eps as f32).sqrt();
-            for k in 0..d {
-                out[base + k] = row[k] * inv * w[k];
-            }
-        }
-    }
-
-    Ok(Tensor::<Dispatch, 3>::from_data(
-        TensorData::new(out, [n, h, d]),
-        &device,
-    ))
+    let inv = x
+        .clone()
+        .powf_scalar(2.0)
+        .mean_dim(2)
+        .add_scalar(eps as f32)
+        .sqrt()
+        .recip();
+    let w = weight
+        .clone()
+        .unsqueeze_dim::<2>(0)
+        .unsqueeze_dim::<3>(0);
+    Ok(x.clone() * inv * w)
 }
 
 fn silu_and_mul_2d(x: &Tensor<Dispatch, 2>) -> Result<Tensor<Dispatch, 2>> {
@@ -301,22 +279,9 @@ fn silu_and_mul_2d(x: &Tensor<Dispatch, 2>) -> Result<Tensor<Dispatch, 2>> {
     let d2 = dims[1];
     ensure!(d2 % 2 == 0, "silu_and_mul last dim must be even");
     let d = d2 / 2;
-    let device = x.device();
-    let data = x.to_data().to_vec::<f32>()?;
-    let mut out = vec![0f32; n * d];
-    for i in 0..n {
-        let row = &data[i * d2..(i + 1) * d2];
-        for j in 0..d {
-            let g = row[j];
-            let u = row[d + j];
-            let silu = g / (1.0 + (-g).exp());
-            out[i * d + j] = silu * u;
-        }
-    }
-    Ok(Tensor::<Dispatch, 2>::from_data(
-        TensorData::new(out, [n, d]),
-        &device,
-    ))
+    let gate = x.clone().slice([0..n, 0..d]);
+    let up = x.clone().slice([0..n, d..d2]);
+    Ok(silu(gate) * up)
 }
 
 fn split_qkv(
@@ -331,23 +296,17 @@ fn split_qkv(
     ensure!(dims.len() == 2, "qkv must be rank-2");
     let n = dims[0];
     ensure!(dims[1] == q_size + kv_size + kv_size, "qkv width mismatch");
-    let device = qkv.device();
-    let data = qkv.to_data().to_vec::<f32>()?;
-
-    let mut q = vec![0f32; n * q_size];
-    let mut k = vec![0f32; n * kv_size];
-    let mut v = vec![0f32; n * kv_size];
-    for i in 0..n {
-        let row = &data[i * dims[1]..(i + 1) * dims[1]];
-        q[i * q_size..(i + 1) * q_size].copy_from_slice(&row[..q_size]);
-        k[i * kv_size..(i + 1) * kv_size].copy_from_slice(&row[q_size..q_size + kv_size]);
-        v[i * kv_size..(i + 1) * kv_size].copy_from_slice(&row[q_size + kv_size..]);
-    }
 
     Ok((
-        Tensor::<Dispatch, 3>::from_data(TensorData::new(q, [n, num_heads, head_dim]), &device),
-        Tensor::<Dispatch, 3>::from_data(TensorData::new(k, [n, num_kv_heads, head_dim]), &device),
-        Tensor::<Dispatch, 3>::from_data(TensorData::new(v, [n, num_kv_heads, head_dim]), &device),
+        qkv.clone()
+            .slice([0..n, 0..q_size])
+            .reshape([n, num_heads, head_dim]),
+        qkv.clone()
+            .slice([0..n, q_size..q_size + kv_size])
+            .reshape([n, num_kv_heads, head_dim]),
+        qkv.clone()
+            .slice([0..n, q_size + kv_size..q_size + kv_size + kv_size])
+            .reshape([n, num_kv_heads, head_dim]),
     ))
 }
 
