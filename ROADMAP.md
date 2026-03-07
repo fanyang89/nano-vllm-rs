@@ -154,6 +154,14 @@ src/
 
 ## 后续优化方向（不在初始版本范围内）
 
+- [ ] Decode 性能专项（按优先级推进）
+  - [ ] P0: 提升并发 batch（多请求同时 decode），优先提高吞吐和 CPU 利用率
+  - [ ] P0: 始终使用 `--release` 做性能测试，避免 dev profile 误判
+  - [ ] P1: 采样路径优化：支持 `top_k/top_p`，温度接近 0 时走 greedy (`argmax`) 旁路
+  - [ ] P1: KV Cache 热点优化：减少 `store_kvcache`/`gather_kv_from_cache` 中的 Rust 循环与小张量 `slice_set` 调用
+  - [ ] P1: Attention 数据流优化：减少 decode 每步重复 `to_dtype/transpose/cat` 的开销
+  - [ ] P2: CPU 后端优化：评估并启用 `candle-core` 的 `mkl` 特性
+  - [ ] P2: 建立性能基线与回归监控：固定 prompt 集与 batch 配置，记录 prefill tok/s、decode tok/s、CPU 利用率
 - [ ] Flash Attention (candle-flash-attn) 用于 prefill 加速
 - [ ] 自定义 CUDA kernel 替代 CPU 循环的 KV Cache 写入
 - [ ] 张量并行 (多 GPU)

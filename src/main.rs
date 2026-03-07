@@ -21,6 +21,10 @@ struct Args {
     /// Maximum number of tokens to generate
     #[arg(long, default_value_t = 256)]
     max_tokens: usize,
+
+    /// Repeat each prompt N times to increase decode batch concurrency
+    #[arg(long, default_value_t = 1)]
+    repeat_prompt: usize,
 }
 
 fn main() -> Result<()> {
@@ -30,11 +34,17 @@ fn main() -> Result<()> {
         "Warning: debug build is slow for inference. Use `cargo run --release -- ...` for real performance."
     );
 
-    let prompts: Vec<&str> = if args.prompt.is_empty() {
-        vec!["Hello, world!"]
+    let base_prompts: Vec<String> = if args.prompt.is_empty() {
+        vec!["Hello, world!".to_string()]
     } else {
-        args.prompt.iter().map(|s| s.as_str()).collect()
+        args.prompt
     };
+    let repeat = args.repeat_prompt.max(1);
+    let expanded_prompts: Vec<String> = base_prompts
+        .iter()
+        .flat_map(|p| std::iter::repeat_n(p.clone(), repeat))
+        .collect();
+    let prompts: Vec<&str> = expanded_prompts.iter().map(|s| s.as_str()).collect();
 
     let sampling_params = SamplingParams::new(args.temperature, args.max_tokens, false);
 
@@ -43,7 +53,12 @@ fn main() -> Result<()> {
     println!("Loading model from: {}", args.model);
     let mut engine = LLMEngine::new(&args.model)?;
 
-    println!("Generating {} prompt(s)...", prompts.len());
+    println!(
+        "Generating {} prompt(s)... (base={}, repeat={})",
+        prompts.len(),
+        base_prompts.len(),
+        repeat
+    );
     let outputs = engine.generate(&prompts, &sampling_params, true)?;
 
     for (i, output) in outputs.iter().enumerate() {
