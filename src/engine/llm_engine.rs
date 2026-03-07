@@ -17,6 +17,12 @@ pub struct GenerationOutput {
     pub token_ids: Vec<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeDevice {
+    Cpu,
+    Cuda,
+}
+
 pub struct LLMEngine {
     tokenizer: tokenizers::Tokenizer,
     scheduler: Scheduler,
@@ -39,12 +45,12 @@ struct GenerationConfig {
 }
 
 impl LLMEngine {
-    pub fn new(model_path: &str) -> Result<Self> {
+    pub fn new(model_path: &str, runtime_device: RuntimeDevice) -> Result<Self> {
         let model_path = std::path::PathBuf::from(model_path);
         let model_config = ModelConfig::from_dir(&model_path)?;
         let mut engine_config = EngineConfig::new(model_path.clone(), &model_config)?;
 
-        let device = Device::Cpu;
+        let device = create_device(runtime_device)?;
         let model_runner = ModelRunner::new(&mut engine_config, &model_config, device)?;
 
         // Load tokenizer
@@ -205,14 +211,30 @@ impl LLMEngine {
         let results: Vec<GenerationOutput> = sorted
             .into_iter()
             .map(|(_, token_ids)| {
-                let text = self
-                    .tokenizer
-                    .decode(&token_ids, true)
-                    .unwrap_or_default();
+                let text = self.tokenizer.decode(&token_ids, true).unwrap_or_default();
                 GenerationOutput { text, token_ids }
             })
             .collect();
 
         Ok(results)
     }
+}
+
+fn create_device(runtime_device: RuntimeDevice) -> Result<Device> {
+    match runtime_device {
+        RuntimeDevice::Cpu => Ok(Device::Cpu),
+        RuntimeDevice::Cuda => create_cuda_device(),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn create_cuda_device() -> Result<Device> {
+    Device::new_cuda(0).map_err(|e| anyhow::anyhow!("failed to initialize CUDA device 0: {e}"))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn create_cuda_device() -> Result<Device> {
+    anyhow::bail!(
+        "CUDA requested but this binary was built without CUDA support. Rebuild with `--features cuda`."
+    )
 }
