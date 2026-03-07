@@ -6,4 +6,5 @@ tasks:
   download:
     desc: Download models
     cmds:
-      - uvx hf download Qwen/Qwen3-0.6B --local-dir ./models/qwen3-0.6b
+      - uvx hf download --local-dir ./models/Qwen3-0.6B Qwen/Qwen3-0.6B
+      - uvx hf download --local-dir ./models/Qwen3-Embedding-0.6B Qwen/Qwen3-Embedding-0.6B
