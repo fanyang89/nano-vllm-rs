@@ -1,0 +1,9 @@
+# https://taskfile.dev
+
+version: "3"
+
+tasks:
+  download:
+    desc: Download models
+    cmds:
+      - uvx hf download Qwen/Qwen3-0.6B --local-dir ./models/qwen3-0.6b
