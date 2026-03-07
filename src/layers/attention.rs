@@ -151,27 +151,24 @@ impl Attention {
         let block_table_i: Vec<u32> = block_tables.i(seq_idx)?.to_vec1()?;
 
         let block_size = k_cache.dim(1)?;
-        let num_full_blocks = seq_len / block_size;
-        let remainder = seq_len % block_size;
+        let blocks_needed = seq_len.div_ceil(block_size);
+        let block_ids = Tensor::from_vec(
+            block_table_i[..blocks_needed].to_vec(),
+            blocks_needed,
+            k_cache.device(),
+        )?;
 
-        let mut k_parts = Vec::new();
-        let mut v_parts = Vec::new();
+        // Gather all blocks in one shot: (B, block, kv_heads, head_dim)
+        let k_blocks = k_cache.index_select(&block_ids, 0)?;
+        let v_blocks = v_cache.index_select(&block_ids, 0)?;
 
-        for b in 0..num_full_blocks {
-            let block_id = block_table_i[b] as usize;
-            // (block_size, num_kv_heads, head_dim)
-            k_parts.push(k_cache.i(block_id)?);
-            v_parts.push(v_cache.i(block_id)?);
-        }
-
-        if remainder > 0 {
-            let block_id = block_table_i[num_full_blocks] as usize;
-            k_parts.push(k_cache.i(block_id)?.narrow(0, 0, remainder)?);
-            v_parts.push(v_cache.i(block_id)?.narrow(0, 0, remainder)?);
-        }
-
-        let k = Tensor::cat(&k_parts, 0)?;
-        let v = Tensor::cat(&v_parts, 0)?;
+        // Flatten blocks then trim to exact sequence length.
+        let k = k_blocks
+            .reshape((blocks_needed * block_size, self.num_kv_heads, self.head_dim))?
+            .narrow(0, 0, seq_len)?;
+        let v = v_blocks
+            .reshape((blocks_needed * block_size, self.num_kv_heads, self.head_dim))?
+            .narrow(0, 0, seq_len)?;
         Ok((k, v))
     }
 
@@ -251,7 +248,11 @@ fn store_kvcache(
     v_cache: &mut Tensor,
     slot_mapping: &Tensor,
 ) -> Result<()> {
-    let slots: Vec<i32> = slot_mapping.to_vec1()?;
+    let slots: Vec<u32> = slot_mapping
+        .to_vec1::<i32>()?
+        .into_iter()
+        .map(|s| if s < 0 { u32::MAX } else { s as u32 })
+        .collect();
     let d = k_cache.dim(2)? * k_cache.dim(3)?; // num_kv_heads * head_dim
 
     // Flatten cache to (num_blocks * block_size, D) for easy scatter
@@ -263,17 +264,11 @@ fn store_kvcache(
     let key_flat = key.reshape((key.dim(0)?, d))?;
     let val_flat = value.reshape((value.dim(0)?, d))?;
 
-    for (i, &slot) in slots.iter().enumerate() {
-        if slot < 0 {
-            continue;
-        }
-        let slot = slot as usize;
-        // src shape (1, D), set at dim=0, offset=slot
-        let k_token = key_flat.narrow(0, i, 1)?;
-        let v_token = val_flat.narrow(0, i, 1)?;
-        k_flat.slice_set(&k_token, 0, slot)?;
-        v_flat.slice_set(&v_token, 0, slot)?;
-    }
+    let n = slots.len();
+    let slot_ids = Tensor::from_vec(slots, n, key.device())?;
+    let indexes = slot_ids.unsqueeze(1)?.expand((n, d))?.contiguous()?;
+    k_flat.scatter_set(&indexes, &key_flat, 0)?;
+    v_flat.scatter_set(&indexes, &val_flat, 0)?;
 
     // Reshape back
     *k_cache = k_flat.reshape(cache_shape.as_slice())?;
