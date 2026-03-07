@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 /// Model architecture config deserialized from config.json in the model directory.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelConfig {
+    #[serde(default)]
+    pub model_type: Option<String>,
     pub vocab_size: usize,
     pub hidden_size: usize,
     pub num_hidden_layers: usize,
@@ -22,6 +24,10 @@ pub struct ModelConfig {
     pub tie_word_embeddings: bool,
     #[serde(default = "default_false")]
     pub attention_bias: bool,
+    #[serde(default)]
+    pub bos_token_id: Option<u32>,
+    #[serde(default)]
+    pub eos_token_id: Option<u32>,
 }
 
 fn default_rms_norm_eps() -> f64 {
