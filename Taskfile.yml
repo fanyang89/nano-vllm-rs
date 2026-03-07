@@ -8,3 +8,11 @@ tasks:
     cmds:
       - uvx hf download --local-dir ./models/Qwen3-0.6B Qwen/Qwen3-0.6B
       - uvx hf download --local-dir ./models/Qwen3-Embedding-0.6B Qwen/Qwen3-Embedding-0.6B
+
+  convert:
+    desc: Build Qwen3 conversion plan from safetensors
+    vars:
+      MODEL: ./models/Qwen3-0.6B
+      OUT: ./models/Qwen3-0.6B/weights-map.json
+    cmds:
+      - cargo run --release -- convert-model --model {{.MODEL}} --out {{.OUT}}
