@@ -7,7 +7,9 @@ use candle_core::{DType, Tensor};
 pub fn sample(logits: &Tensor, temperatures: &Tensor, do_sample: bool) -> Result<Vec<u32>> {
     // Fast path for deterministic decode.
     if !do_sample {
-        let token_ids = logits.to_dtype(DType::F32)?.argmax(candle_core::D::Minus1)?;
+        let token_ids = logits
+            .to_dtype(DType::F32)?
+            .argmax(candle_core::D::Minus1)?;
         return Ok(token_ids.to_vec1()?);
     }
 
@@ -18,9 +20,7 @@ pub fn sample(logits: &Tensor, temperatures: &Tensor, do_sample: bool) -> Result
     let logits = logits.to_dtype(DType::F32)?;
 
     // temperatures: (batch,) -> (batch, 1)
-    let temps = temperatures
-        .to_dtype(DType::F32)?
-        .unsqueeze(1)?;
+    let temps = temperatures.to_dtype(DType::F32)?.unsqueeze(1)?;
 
     // Scale logits by temperature
     let scaled = logits.broadcast_div(&temps)?;
@@ -28,7 +28,12 @@ pub fn sample(logits: &Tensor, temperatures: &Tensor, do_sample: bool) -> Result
     // Gumbel-max trick: argmax(logits + gumbel_noise)
     // where gumbel_noise = -log(-log(U)), U ~ Uniform(0,1).
     let uniform = Tensor::rand(0.0f32, 1.0, shape.as_slice(), device)?;
-    let gumbel_noise = uniform.clamp(1e-10, 1.0 - 1e-10)?.log()?.neg()?.log()?.neg()?;
+    let gumbel_noise = uniform
+        .clamp(1e-10, 1.0 - 1e-10)?
+        .log()?
+        .neg()?
+        .log()?
+        .neg()?;
     let scores = scaled.broadcast_add(&gumbel_noise)?;
     let token_ids = scores.argmax(candle_core::D::Minus1)?;
 

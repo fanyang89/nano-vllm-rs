@@ -39,9 +39,8 @@ impl ModelRunner {
             .filter(|p| p.extension().is_some_and(|ext| ext == "safetensors"))
             .collect();
 
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&safetensors_files, dtype, &device)?
-        };
+        let vb =
+            unsafe { VarBuilder::from_mmaped_safetensors(&safetensors_files, dtype, &device)? };
 
         let model = Qwen3ForCausalLM::new(model_config, vb)?;
 
@@ -72,8 +71,7 @@ impl ModelRunner {
         let block_size = engine_config.kvcache_block_size;
 
         // For CPU, use a fixed number of blocks based on max_model_len
-        let max_blocks_per_seq =
-            (engine_config.max_model_len + block_size - 1) / block_size;
+        let max_blocks_per_seq = (engine_config.max_model_len + block_size - 1) / block_size;
         let num_blocks = max_blocks_per_seq * engine_config.max_num_seqs;
         // Cap at a reasonable size for CPU
         let num_blocks = num_blocks.min(1024);

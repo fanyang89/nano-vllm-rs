@@ -1,6 +1,6 @@
 use anyhow::Result;
 use candle_core::{Module, Tensor};
-use candle_nn::{linear_no_bias, Embedding, Linear, RmsNorm, VarBuilder};
+use candle_nn::{Embedding, Linear, RmsNorm, VarBuilder, linear_no_bias};
 
 use crate::config::ModelConfig;
 use crate::layers::attention::Attention;
@@ -115,7 +115,11 @@ impl Qwen3Attention {
 
         let mut q = qkv.narrow(candle_core::D::Minus1, 0, self.q_size)?;
         let mut k = qkv.narrow(candle_core::D::Minus1, self.q_size, self.kv_size)?;
-        let v = qkv.narrow(candle_core::D::Minus1, self.q_size + self.kv_size, self.kv_size)?;
+        let v = qkv.narrow(
+            candle_core::D::Minus1,
+            self.q_size + self.kv_size,
+            self.kv_size,
+        )?;
 
         // Reshape to (N, num_heads, head_dim)
         let n = q.dim(0)?;
@@ -209,13 +213,16 @@ impl Qwen3DecoderLayer {
         ctx: &AttentionContext,
     ) -> Result<(Tensor, Tensor)> {
         let (normed, residual) = if let Some(res) = residual {
-            self.input_layernorm.forward_with_residual(hidden_states, res)?
+            self.input_layernorm
+                .forward_with_residual(hidden_states, res)?
         } else {
             let normed = self.input_layernorm.forward(hidden_states)?;
             (normed, hidden_states.clone())
         };
 
-        let hidden_states = self.self_attn.forward(positions, &normed, k_cache, v_cache, ctx)?;
+        let hidden_states = self
+            .self_attn
+            .forward(positions, &normed, k_cache, v_cache, ctx)?;
         let (normed, residual) = self
             .post_attention_layernorm
             .forward_with_residual(&hidden_states, &residual)?;
@@ -321,11 +328,7 @@ impl Qwen3ForCausalLM {
 
     /// Compute logits from hidden states.
     /// During prefill, extracts only the last token per sequence.
-    pub fn compute_logits(
-        &self,
-        hidden_states: &Tensor,
-        ctx: &AttentionContext,
-    ) -> Result<Tensor> {
+    pub fn compute_logits(&self, hidden_states: &Tensor, ctx: &AttentionContext) -> Result<Tensor> {
         let hidden = if ctx.is_prefill {
             // Extract last token per sequence using cu_seqlens_q
             let cu_seqlens: Vec<u32> = ctx.cu_seqlens_q.to_vec1()?;

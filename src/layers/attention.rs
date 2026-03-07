@@ -318,12 +318,18 @@ mod tests {
         let num_kv_heads = 2;
         let head_dim = 4;
 
-        let mut k_cache =
-            Tensor::zeros((num_blocks, block_size, num_kv_heads, head_dim), DType::F32, &device)
-                .unwrap();
-        let mut v_cache =
-            Tensor::zeros((num_blocks, block_size, num_kv_heads, head_dim), DType::F32, &device)
-                .unwrap();
+        let mut k_cache = Tensor::zeros(
+            (num_blocks, block_size, num_kv_heads, head_dim),
+            DType::F32,
+            &device,
+        )
+        .unwrap();
+        let mut v_cache = Tensor::zeros(
+            (num_blocks, block_size, num_kv_heads, head_dim),
+            DType::F32,
+            &device,
+        )
+        .unwrap();
 
         // Store 2 tokens: slot 0 (block0, offset0) and slot 3 (block1, offset1)
         let key = Tensor::ones((2, num_kv_heads, head_dim), DType::F32, &device).unwrap();
@@ -355,20 +361,26 @@ mod tests {
         let num_kv_heads = 2;
         let head_dim = 8;
 
-        let mut k_cache =
-            Tensor::zeros((num_blocks, block_size, num_kv_heads, head_dim), DType::F32, &device)
-                .unwrap();
-        let mut v_cache =
-            Tensor::zeros((num_blocks, block_size, num_kv_heads, head_dim), DType::F32, &device)
-                .unwrap();
+        let mut k_cache = Tensor::zeros(
+            (num_blocks, block_size, num_kv_heads, head_dim),
+            DType::F32,
+            &device,
+        )
+        .unwrap();
+        let mut v_cache = Tensor::zeros(
+            (num_blocks, block_size, num_kv_heads, head_dim),
+            DType::F32,
+            &device,
+        )
+        .unwrap();
 
         // 2 sequences: seq0 has 3 tokens, seq1 has 2 tokens
         let total_tokens = 5;
         let q = Tensor::randn(0.0f32, 1.0, (total_tokens, 4, head_dim), &device).unwrap();
-        let k = Tensor::randn(0.0f32, 1.0, (total_tokens, num_kv_heads, head_dim), &device)
-            .unwrap();
-        let v = Tensor::randn(0.0f32, 1.0, (total_tokens, num_kv_heads, head_dim), &device)
-            .unwrap();
+        let k =
+            Tensor::randn(0.0f32, 1.0, (total_tokens, num_kv_heads, head_dim), &device).unwrap();
+        let v =
+            Tensor::randn(0.0f32, 1.0, (total_tokens, num_kv_heads, head_dim), &device).unwrap();
 
         let ctx = AttentionContext {
             is_prefill: true,
