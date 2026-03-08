@@ -15,6 +15,16 @@ pub fn sample(
     let batch = dims[0];
     let vocab = dims[1];
 
+    if !do_sample {
+        let token_ids = logits
+            .clone()
+            .argmax(1)
+            .to_data()
+            .to_vec::<i32>()
+            .context("failed to read argmax token ids")?;
+        return Ok(token_ids.into_iter().map(|id| id as u32).collect());
+    }
+
     let logits = logits
         .to_data()
         .to_vec::<f32>()

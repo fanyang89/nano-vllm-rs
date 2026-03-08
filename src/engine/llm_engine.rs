@@ -122,7 +122,7 @@ impl LLMEngine {
         Ok(())
     }
 
-    fn step(&mut self) -> Result<(Vec<(usize, Vec<u32>)>, i64)> {
+    fn step(&mut self) -> Result<(Vec<(usize, Vec<u32>)>, i64, usize)> {
         let (seq_ids, is_prefill) = self.scheduler.schedule();
 
         // Collect sequence references for model_runner
@@ -138,9 +138,10 @@ impl LLMEngine {
         };
 
         let token_ids = self.model_runner.run(&seq_refs, is_prefill)?;
+        let generated_tokens = token_ids.len();
         let finished = self.scheduler.postprocess(&seq_ids, &token_ids);
 
-        Ok((finished, num_tokens))
+        Ok((finished, num_tokens, generated_tokens))
     }
 
     pub fn generate(
@@ -154,7 +155,8 @@ impl LLMEngine {
         }
 
         let pb = if use_tqdm {
-            let pb = ProgressBar::new(prompts.len() as u64);
+            let total_tokens = prompts.len().saturating_mul(sampling_params.max_tokens) as u64;
+            let pb = ProgressBar::new(total_tokens);
             pb.set_style(
                 ProgressStyle::default_bar()
                     .template("{msg} [{bar:40}] {pos}/{len}")
@@ -167,30 +169,46 @@ impl LLMEngine {
         };
 
         let mut outputs: HashMap<usize, Vec<u32>> = HashMap::new();
-        let mut prefill_tps = 0.0f64;
-        let mut decode_tps = 0.0f64;
+        let mut prefill_tokens_total = 0u64;
+        let mut prefill_time_total = 0.0f64;
+        let mut decode_tokens_total = 0u64;
+        let mut decode_time_total = 0.0f64;
         let mut last_pb_update = Instant::now();
 
         while !self.scheduler.is_finished() {
             let t = Instant::now();
-            let (finished, num_tokens) = self.step()?;
+            let (finished, num_tokens, generated_tokens) = self.step()?;
             let elapsed = t.elapsed().as_secs_f64();
 
             if num_tokens > 0 {
-                prefill_tps = num_tokens as f64 / elapsed;
+                prefill_tokens_total += num_tokens as u64;
+                prefill_time_total += elapsed;
             } else {
-                decode_tps = (-num_tokens) as f64 / elapsed;
+                decode_tokens_total += (-num_tokens) as u64;
+                decode_time_total += elapsed;
             }
 
             for (seq_id, token_ids) in finished {
                 outputs.insert(seq_id, token_ids);
-                if let Some(pb) = &pb {
-                    pb.inc(1);
-                }
+            }
+
+            if let Some(pb) = &pb {
+                let remaining = pb.length().unwrap_or(0).saturating_sub(pb.position());
+                pb.inc((generated_tokens as u64).min(remaining));
             }
 
             if let Some(pb) = &pb {
                 if last_pb_update.elapsed().as_millis() >= 100 {
+                    let prefill_tps = if prefill_time_total > 0.0 {
+                        prefill_tokens_total as f64 / prefill_time_total
+                    } else {
+                        0.0
+                    };
+                    let decode_tps = if decode_time_total > 0.0 {
+                        decode_tokens_total as f64 / decode_time_total
+                    } else {
+                        0.0
+                    };
                     pb.set_message(format!(
                         "Prefill: {:.0} tok/s  Decode: {:.0} tok/s",
                         prefill_tps, decode_tps
@@ -201,6 +219,12 @@ impl LLMEngine {
         }
 
         if let Some(pb) = &pb {
+            if let Some(len) = pb.length() {
+                let pos = pb.position();
+                if pos < len {
+                    pb.set_length(pos);
+                }
+            }
             pb.finish();
         }
 
