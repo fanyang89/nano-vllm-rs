@@ -5,14 +5,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::Serialize;
 use tablestream::{Column, Stream};
 
 use nano_vllm_rs::chat::{
-    ChatFormat, ChatMessage, ChatRole, render_chat_prompt, strip_think_blocks,
+    render_chat_prompt, strip_think_blocks, ChatFormat, ChatMessage, ChatRole,
 };
 use nano_vllm_rs::config::ModelConfig;
 use nano_vllm_rs::{GenerationStats, LLMEngine, ProgressConfig, RuntimeDevice, SamplingParams};
@@ -568,6 +568,8 @@ fn run_benchmark_py(args: BenchPyArgs) -> Result<()> {
     }
 
     let mut throughputs = Vec::with_capacity(args.iters);
+    let mut prefill_tps_values = Vec::with_capacity(args.iters);
+    let mut decode_tps_values = Vec::with_capacity(args.iters);
     let total_tokens: usize = sampling_params.iter().map(|sp| sp.max_tokens).sum();
     for iter in 0..args.iters {
         let progress_label = format!(
@@ -581,29 +583,38 @@ fn run_benchmark_py(args: BenchPyArgs) -> Result<()> {
         let progress =
             (!args.quiet).then(|| ProgressConfig::new(progress_label, Duration::from_secs(1)));
         let started = Instant::now();
-        let _ = engine.generate_token_ids_batch_with_stats_and_progress(
+        let (_, stats) = engine.generate_token_ids_batch_with_stats_and_progress(
             &prompt_token_ids,
             &sampling_params,
             progress.as_ref(),
         )?;
         let elapsed = started.elapsed().as_secs_f64();
         let throughput = total_tokens as f64 / elapsed;
+        let metrics = to_metrics(&stats, total_tokens, elapsed);
         throughputs.push(throughput);
+        prefill_tps_values.push(metrics.prefill_tps);
+        decode_tps_values.push(metrics.decode_tps);
         println!(
-            "Iter {}/{}: Total: {}tok, Time: {:.2}s, Throughput: {:.2}tok/s",
+            "Iter {}/{}: Total: {}tok, Time: {:.2}s, Throughput: {:.2}tok/s, Prefill: {:.2}tok/s, Decode: {:.2}tok/s",
             iter + 1,
             args.iters,
             total_tokens,
             elapsed,
-            throughput
+            throughput,
+            metrics.prefill_tps,
+            metrics.decode_tps,
         );
     }
 
     let mean = throughputs.iter().sum::<f64>() / throughputs.len() as f64;
+    let mean_prefill_tps = prefill_tps_values.iter().sum::<f64>() / prefill_tps_values.len() as f64;
+    let mean_decode_tps = decode_tps_values.iter().sum::<f64>() / decode_tps_values.len() as f64;
     println!(
-        "Mean throughput over {} iter(s): {:.2}tok/s",
+        "Mean throughput over {} iter(s): {:.2}tok/s | Prefill: {:.2}tok/s | Decode: {:.2}tok/s",
         throughputs.len(),
-        mean
+        mean,
+        mean_prefill_tps,
+        mean_decode_tps,
     );
     Ok(())
 }
