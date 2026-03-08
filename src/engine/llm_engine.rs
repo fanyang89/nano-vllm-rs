@@ -10,12 +10,28 @@ use serde::Deserialize;
 use crate::backend::CpuBackend;
 #[cfg(feature = "rocm")]
 use crate::backend::RocmBackend;
+use crate::chat::{ChatFormat, format_single_prompt};
 use crate::config::{EngineConfig, ModelConfig};
 use crate::engine::model_runner::ModelRunner;
 use crate::engine::scheduler::Scheduler;
 use crate::engine::sequence::Sequence;
 use crate::sampling_params::SamplingParams;
 use crate::utils::profiler;
+
+#[derive(Debug, Clone)]
+pub struct ProgressConfig {
+    pub label: String,
+    pub refresh_interval: std::time::Duration,
+}
+
+impl ProgressConfig {
+    pub fn new(label: impl Into<String>, refresh_interval: std::time::Duration) -> Self {
+        Self {
+            label: label.into(),
+            refresh_interval,
+        }
+    }
+}
 
 pub struct GenerationOutput {
     pub text: String,
@@ -52,7 +68,7 @@ pub struct LLMEngineImpl<B: Backend<IntElem = i32>> {
     scheduler: Scheduler,
     model_runner: ModelRunner<B>,
     block_size: usize,
-    use_qwen3_chat: bool,
+    chat_format: ChatFormat,
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,6 +122,19 @@ impl LLMEngine {
         }
     }
 
+    pub fn add_formatted_request(
+        &mut self,
+        prompt: &str,
+        sampling_params: &SamplingParams,
+    ) -> Result<()> {
+        match self {
+            #[cfg(feature = "cpu")]
+            Self::Cpu(engine) => engine.add_formatted_request(prompt, sampling_params),
+            #[cfg(feature = "rocm")]
+            Self::Rocm(engine) => engine.add_formatted_request(prompt, sampling_params),
+        }
+    }
+
     pub fn add_request_token_ids(
         &mut self,
         prompt_token_ids: Vec<u32>,
@@ -125,7 +154,26 @@ impl LLMEngine {
         sampling_params: &SamplingParams,
         use_tqdm: bool,
     ) -> Result<Vec<GenerationOutput>> {
-        let (outputs, _stats) = self.generate_with_stats(prompts, sampling_params, use_tqdm)?;
+        let progress = use_tqdm
+            .then(|| ProgressConfig::new("Generating", std::time::Duration::from_millis(100)));
+        let (outputs, _stats) =
+            self.generate_with_stats_and_progress(prompts, sampling_params, progress.as_ref())?;
+        Ok(outputs)
+    }
+
+    pub fn generate_formatted(
+        &mut self,
+        prompts: &[&str],
+        sampling_params: &SamplingParams,
+        use_tqdm: bool,
+    ) -> Result<Vec<GenerationOutput>> {
+        let progress = use_tqdm
+            .then(|| ProgressConfig::new("Generating", std::time::Duration::from_millis(100)));
+        let (outputs, _stats) = self.generate_formatted_with_stats_and_progress(
+            prompts,
+            sampling_params,
+            progress.as_ref(),
+        )?;
         Ok(outputs)
     }
 
@@ -135,8 +183,13 @@ impl LLMEngine {
         sampling_params: &[SamplingParams],
         use_tqdm: bool,
     ) -> Result<Vec<GenerationOutput>> {
-        let (outputs, _stats) =
-            self.generate_token_ids_batch_with_stats(prompt_token_ids, sampling_params, use_tqdm)?;
+        let progress = use_tqdm
+            .then(|| ProgressConfig::new("Generating", std::time::Duration::from_millis(100)));
+        let (outputs, _stats) = self.generate_token_ids_batch_with_stats_and_progress(
+            prompt_token_ids,
+            sampling_params,
+            progress.as_ref(),
+        )?;
         Ok(outputs)
     }
 
@@ -146,18 +199,33 @@ impl LLMEngine {
         sampling_params: &[SamplingParams],
         use_tqdm: bool,
     ) -> Result<(Vec<GenerationOutput>, GenerationStats)> {
+        let progress = use_tqdm
+            .then(|| ProgressConfig::new("Generating", std::time::Duration::from_millis(100)));
+        self.generate_token_ids_batch_with_stats_and_progress(
+            prompt_token_ids,
+            sampling_params,
+            progress.as_ref(),
+        )
+    }
+
+    pub fn generate_token_ids_batch_with_stats_and_progress(
+        &mut self,
+        prompt_token_ids: &[Vec<u32>],
+        sampling_params: &[SamplingParams],
+        progress: Option<&ProgressConfig>,
+    ) -> Result<(Vec<GenerationOutput>, GenerationStats)> {
         match self {
             #[cfg(feature = "cpu")]
             Self::Cpu(engine) => engine.generate_token_ids_batch_with_stats(
                 prompt_token_ids,
                 sampling_params,
-                use_tqdm,
+                progress,
             ),
             #[cfg(feature = "rocm")]
             Self::Rocm(engine) => engine.generate_token_ids_batch_with_stats(
                 prompt_token_ids,
                 sampling_params,
-                use_tqdm,
+                progress,
             ),
         }
     }
@@ -168,13 +236,83 @@ impl LLMEngine {
         sampling_params: &SamplingParams,
         use_tqdm: bool,
     ) -> Result<(Vec<GenerationOutput>, GenerationStats)> {
+        let progress = use_tqdm
+            .then(|| ProgressConfig::new("Generating", std::time::Duration::from_millis(100)));
+        self.generate_with_stats_and_progress(prompts, sampling_params, progress.as_ref())
+    }
+
+    pub fn generate_formatted_with_stats_and_progress(
+        &mut self,
+        prompts: &[&str],
+        sampling_params: &SamplingParams,
+        progress: Option<&ProgressConfig>,
+    ) -> Result<(Vec<GenerationOutput>, GenerationStats)> {
         match self {
             #[cfg(feature = "cpu")]
-            Self::Cpu(engine) => engine.generate_with_stats(prompts, sampling_params, use_tqdm),
+            Self::Cpu(engine) => {
+                engine.generate_with_stats_impl(prompts, sampling_params, progress, true)
+            }
             #[cfg(feature = "rocm")]
-            Self::Rocm(engine) => engine.generate_with_stats(prompts, sampling_params, use_tqdm),
+            Self::Rocm(engine) => {
+                engine.generate_with_stats_impl(prompts, sampling_params, progress, true)
+            }
         }
     }
+
+    pub fn generate_with_stats_and_progress(
+        &mut self,
+        prompts: &[&str],
+        sampling_params: &SamplingParams,
+        progress: Option<&ProgressConfig>,
+    ) -> Result<(Vec<GenerationOutput>, GenerationStats)> {
+        match self {
+            #[cfg(feature = "cpu")]
+            Self::Cpu(engine) => engine.generate_with_stats(prompts, sampling_params, progress),
+            #[cfg(feature = "rocm")]
+            Self::Rocm(engine) => engine.generate_with_stats(prompts, sampling_params, progress),
+        }
+    }
+}
+
+fn create_progress_bar(
+    total_tokens: u64,
+    progress: Option<&ProgressConfig>,
+) -> Option<ProgressBar> {
+    let progress = progress?;
+    let pb = ProgressBar::new(total_tokens);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{msg} [{bar:40}] {pos}/{len}")
+            .unwrap()
+            .progress_chars("=> "),
+    );
+    pb.set_message(progress.label.clone());
+    Some(pb)
+}
+
+fn prefill_tps(stats: &GenerationStats) -> f64 {
+    if stats.prefill_time_s > 0.0 {
+        stats.prefill_tokens as f64 / stats.prefill_time_s
+    } else {
+        0.0
+    }
+}
+
+fn decode_tps(stats: &GenerationStats) -> f64 {
+    if stats.decode_time_s > 0.0 {
+        stats.decode_tokens as f64 / stats.decode_time_s
+    } else {
+        0.0
+    }
+}
+
+fn update_progress_message(pb: &ProgressBar, progress: &ProgressConfig, stats: &GenerationStats) {
+    pb.set_message(format!(
+        "{} | Prefill: {:.0} tok/s | Decode: {:.0} tok/s",
+        progress.label,
+        prefill_tps(stats),
+        decode_tps(stats)
+    ));
 }
 
 impl<B: Backend<IntElem = i32>> LLMEngineImpl<B> {
@@ -218,7 +356,7 @@ impl<B: Backend<IntElem = i32>> LLMEngineImpl<B> {
             }
         }
 
-        let use_qwen3_chat = model_config.model_type.as_deref() == Some("qwen3");
+        let chat_format = ChatFormat::from_model_config(&model_config);
         let block_size = engine_config.kvcache_block_size;
         let scheduler = Scheduler::new(&engine_config);
 
@@ -227,18 +365,20 @@ impl<B: Backend<IntElem = i32>> LLMEngineImpl<B> {
             scheduler,
             model_runner,
             block_size,
-            use_qwen3_chat,
+            chat_format,
         })
     }
 
     fn add_request(&mut self, prompt: &str, sampling_params: &SamplingParams) -> Result<()> {
-        let prompt = if self.use_qwen3_chat {
-            format!(
-                "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
-            )
-        } else {
-            prompt.to_string()
-        };
+        let prompt = format_single_prompt(prompt, self.chat_format);
+        self.add_formatted_request(&prompt, sampling_params)
+    }
+
+    fn add_formatted_request(
+        &mut self,
+        prompt: &str,
+        sampling_params: &SamplingParams,
+    ) -> Result<()> {
         let encoding = self
             .tokenizer
             .encode(prompt, false)
@@ -283,28 +423,33 @@ impl<B: Backend<IntElem = i32>> LLMEngineImpl<B> {
         &mut self,
         prompts: &[&str],
         sampling_params: &SamplingParams,
-        use_tqdm: bool,
+        progress: Option<&ProgressConfig>,
+    ) -> Result<(Vec<GenerationOutput>, GenerationStats)> {
+        self.generate_with_stats_impl(prompts, sampling_params, progress, false)
+    }
+
+    fn generate_with_stats_impl(
+        &mut self,
+        prompts: &[&str],
+        sampling_params: &SamplingParams,
+        progress: Option<&ProgressConfig>,
+        prompts_are_formatted: bool,
     ) -> Result<(Vec<GenerationOutput>, GenerationStats)> {
         profiler::reset();
 
         for prompt in prompts {
-            self.add_request(prompt, sampling_params)?;
+            if prompts_are_formatted {
+                self.add_formatted_request(prompt, sampling_params)?;
+            } else {
+                self.add_request(prompt, sampling_params)?;
+            }
         }
 
         let total_start = Instant::now();
-        let pb = if use_tqdm {
-            let total_tokens = prompts.len().saturating_mul(sampling_params.max_tokens) as u64;
-            let pb = ProgressBar::new(total_tokens);
-            pb.set_style(
-                ProgressStyle::default_bar()
-                    .template("{msg} [{bar:40}] {pos}/{len}")
-                    .unwrap()
-                    .progress_chars("=> "),
-            );
-            Some(pb)
-        } else {
-            None
-        };
+        let pb = create_progress_bar(
+            prompts.len().saturating_mul(sampling_params.max_tokens) as u64,
+            progress,
+        );
 
         let mut outputs: HashMap<usize, Vec<u32>> = HashMap::new();
         let mut stats = GenerationStats::default();
@@ -342,32 +487,17 @@ impl<B: Backend<IntElem = i32>> LLMEngineImpl<B> {
             }
 
             if let Some(pb) = &pb {
-                if last_pb_update.elapsed().as_millis() >= 100 {
-                    let prefill_tps = if stats.prefill_time_s > 0.0 {
-                        stats.prefill_tokens as f64 / stats.prefill_time_s
-                    } else {
-                        0.0
-                    };
-                    let decode_tps = if stats.decode_time_s > 0.0 {
-                        stats.decode_tokens as f64 / stats.decode_time_s
-                    } else {
-                        0.0
-                    };
-                    let decode_steady_tps = if stats.decode_steady_time_s > 0.0 {
-                        stats.decode_steady_tokens as f64 / stats.decode_steady_time_s
-                    } else {
-                        decode_tps
-                    };
-                    pb.set_message(format!(
-                        "Prefill: {:.0} tok/s  Decode(steady): {:.0} tok/s",
-                        prefill_tps, decode_steady_tps
-                    ));
+                if progress.is_some_and(|cfg| last_pb_update.elapsed() >= cfg.refresh_interval) {
+                    update_progress_message(pb, progress.expect("checked is_some"), &stats);
                     last_pb_update = Instant::now();
                 }
             }
         }
 
         if let Some(pb) = &pb {
+            if let Some(progress) = progress {
+                update_progress_message(pb, progress, &stats);
+            }
             if let Some(len) = pb.length() {
                 let pos = pb.position();
                 if pos < len {
@@ -400,7 +530,7 @@ impl<B: Backend<IntElem = i32>> LLMEngineImpl<B> {
         &mut self,
         prompt_token_ids: &[Vec<u32>],
         sampling_params: &[SamplingParams],
-        use_tqdm: bool,
+        progress: Option<&ProgressConfig>,
     ) -> Result<(Vec<GenerationOutput>, GenerationStats)> {
         anyhow::ensure!(
             prompt_token_ids.len() == sampling_params.len(),
@@ -413,22 +543,13 @@ impl<B: Backend<IntElem = i32>> LLMEngineImpl<B> {
         }
 
         let total_start = Instant::now();
-        let pb = if use_tqdm {
-            let total_tokens = sampling_params
+        let pb = create_progress_bar(
+            sampling_params
                 .iter()
                 .map(|sp| sp.max_tokens)
-                .sum::<usize>() as u64;
-            let pb = ProgressBar::new(total_tokens);
-            pb.set_style(
-                ProgressStyle::default_bar()
-                    .template("{msg} [{bar:40}] {pos}/{len}")
-                    .unwrap()
-                    .progress_chars("=> "),
-            );
-            Some(pb)
-        } else {
-            None
-        };
+                .sum::<usize>() as u64,
+            progress,
+        );
 
         let mut outputs: HashMap<usize, Vec<u32>> = HashMap::new();
         let mut stats = GenerationStats::default();
@@ -466,19 +587,17 @@ impl<B: Backend<IntElem = i32>> LLMEngineImpl<B> {
             }
 
             if let Some(pb) = &pb {
-                if last_pb_update.elapsed().as_millis() >= 100 {
-                    let decode_steady_tps = if stats.decode_steady_time_s > 0.0 {
-                        stats.decode_steady_tokens as f64 / stats.decode_steady_time_s
-                    } else {
-                        0.0
-                    };
-                    pb.set_message(format!("Decode(steady): {:.0} tok/s", decode_steady_tps));
+                if progress.is_some_and(|cfg| last_pb_update.elapsed() >= cfg.refresh_interval) {
+                    update_progress_message(pb, progress.expect("checked is_some"), &stats);
                     last_pb_update = Instant::now();
                 }
             }
         }
 
         if let Some(pb) = &pb {
+            if let Some(progress) = progress {
+                update_progress_message(pb, progress, &stats);
+            }
             if let Some(len) = pb.length() {
                 let pos = pb.position();
                 if pos < len {

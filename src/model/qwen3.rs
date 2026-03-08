@@ -1,7 +1,7 @@
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, ensure};
 use burn::tensor::activation::silu;
-use burn::tensor::{backend::Backend, DType, Element, Int, Tensor, TensorData};
-use safetensors::{tensor::TensorView, Dtype, SafeTensors};
+use burn::tensor::{DType, Element, Int, Tensor, TensorData, backend::Backend};
+use safetensors::{Dtype, SafeTensors, tensor::TensorView};
 
 use crate::config::ModelConfig;
 use crate::engine::kv_cache::KvCache;

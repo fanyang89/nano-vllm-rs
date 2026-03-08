@@ -1,15 +1,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use std::time::Instant;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde::Serialize;
 use tablestream::{Column, Stream};
 
-use nano_vllm_rs::{GenerationStats, LLMEngine, RuntimeDevice, SamplingParams};
+use nano_vllm_rs::chat::{
+    ChatFormat, ChatMessage, ChatRole, render_chat_prompt, strip_think_blocks,
+};
+use nano_vllm_rs::config::ModelConfig;
+use nano_vllm_rs::{GenerationStats, LLMEngine, ProgressConfig, RuntimeDevice, SamplingParams};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum CliDevice {
@@ -21,6 +27,8 @@ enum CliDevice {
 enum Commands {
     /// Run text generation inference
     Run(RunArgs),
+    /// Start an interactive chat REPL
+    Repl(ReplArgs),
     /// Run performance benchmarks
     Bench(BenchArgs),
     /// Run benchmark compatible with nano-vllm/bench.py
@@ -61,6 +69,33 @@ struct RunArgs {
     /// Repeat each prompt N times to increase decode batch concurrency
     #[arg(long, default_value_t = 1)]
     repeat_prompt: usize,
+
+    /// Disable random sampling and use greedy decoding (argmax)
+    #[arg(long, default_value_t = false)]
+    greedy: bool,
+}
+
+#[derive(Parser, Debug)]
+struct ReplArgs {
+    /// Path to model directory (containing safetensors + config.json + tokenizer.json)
+    #[arg(long)]
+    model: String,
+
+    /// Runtime device to use
+    #[arg(long, value_enum)]
+    device: CliDevice,
+
+    /// System prompt to keep for the whole session
+    #[arg(long)]
+    system: Option<String>,
+
+    /// Sampling temperature
+    #[arg(long, default_value_t = 0.6)]
+    temperature: f32,
+
+    /// Maximum number of tokens to generate
+    #[arg(long, default_value_t = 256)]
+    max_tokens: usize,
 
     /// Disable random sampling and use greedy decoding (argmax)
     #[arg(long, default_value_t = false)]
@@ -157,6 +192,10 @@ struct BenchPyArgs {
     /// RNG seed
     #[arg(long, default_value_t = 0)]
     seed: u64,
+
+    /// Disable live progress updates during timed iterations
+    #[arg(long, default_value_t = false)]
+    quiet: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -189,6 +228,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Run(args) => run_inference(args),
+        Commands::Repl(args) => run_repl(args),
         Commands::Bench(args) => run_benchmark(args),
         Commands::BenchPy(args) => run_benchmark_py(args),
         Commands::ConvertModel(args) => run_convert_model(args),
@@ -210,6 +250,64 @@ struct BenchScenario {
     repeat: usize,
     prompt_count: usize,
     metrics: Vec<IterMetrics>,
+}
+
+#[derive(Debug, Clone)]
+struct ReplSession {
+    chat_format: ChatFormat,
+    system_prompt: Option<String>,
+    history: Vec<ChatMessage>,
+}
+
+impl ReplSession {
+    fn new(chat_format: ChatFormat, system_prompt: Option<String>) -> Self {
+        Self {
+            chat_format,
+            system_prompt,
+            history: Vec::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.history.clear();
+    }
+
+    fn add_user_message(&mut self, content: impl Into<String>) {
+        self.history.push(ChatMessage::new(ChatRole::User, content));
+    }
+
+    fn add_assistant_message(&mut self, content: impl Into<String>) {
+        self.history
+            .push(ChatMessage::new(ChatRole::Assistant, content));
+    }
+
+    fn messages(&self) -> Vec<ChatMessage> {
+        let mut messages =
+            Vec::with_capacity(self.history.len() + usize::from(self.system_prompt.is_some()));
+        if let Some(system_prompt) = &self.system_prompt {
+            messages.push(ChatMessage::new(ChatRole::System, system_prompt.clone()));
+        }
+        messages.extend(self.history.iter().cloned());
+        messages
+    }
+
+    fn render_prompt(&self) -> String {
+        let messages = self.messages();
+        render_chat_prompt(&messages, self.chat_format, true)
+    }
+
+    fn print_history(&self) {
+        let messages = self.messages();
+        if messages.is_empty() {
+            println!("(history is empty)");
+            return;
+        }
+
+        for message in messages {
+            println!("\n{}:\n{}", message.role.label(), message.content);
+        }
+        println!();
+    }
 }
 
 fn run_inference(args: RunArgs) -> Result<()> {
@@ -246,6 +344,82 @@ fn run_inference(args: RunArgs) -> Result<()> {
     for (i, output) in outputs.iter().enumerate() {
         println!("\n--- Output {} ---", i + 1);
         println!("{}", output.text);
+    }
+
+    Ok(())
+}
+
+fn run_repl(args: ReplArgs) -> Result<()> {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "Warning: debug build is slow for inference. Use `cargo run --release -- repl ...` for real performance."
+    );
+
+    tracing_subscriber::fmt::init();
+
+    println!("Loading model from: {}", args.model);
+    let runtime_device = match args.device {
+        CliDevice::Cpu => RuntimeDevice::Cpu,
+        CliDevice::Rocm => RuntimeDevice::Rocm,
+    };
+    let model_config = ModelConfig::from_dir(Path::new(&args.model))?;
+    let chat_format = ChatFormat::from_model_config(&model_config);
+    let mut session = ReplSession::new(chat_format, args.system.clone());
+    let sampling_params =
+        SamplingParams::new(args.temperature, args.max_tokens, false, !args.greedy);
+    let mut engine = LLMEngine::new(&args.model, runtime_device)?;
+
+    println!("Chat REPL ready.");
+    println!("Commands: /history, /clear, /exit");
+    if let Some(system_prompt) = &args.system {
+        println!("System: {}", system_prompt);
+    }
+
+    let stdin = io::stdin();
+    let mut line = String::new();
+
+    loop {
+        print!("> ");
+        io::stdout().flush()?;
+
+        line.clear();
+        let read = stdin.read_line(&mut line)?;
+        if read == 0 {
+            println!();
+            break;
+        }
+
+        let input = line.trim();
+        if input.is_empty() {
+            continue;
+        }
+
+        match input {
+            "/exit" | "/quit" => break,
+            "/clear" => {
+                session.clear();
+                println!("Cleared conversation history. System prompt preserved.");
+                continue;
+            }
+            "/history" => {
+                session.print_history();
+                continue;
+            }
+            _ => {}
+        }
+
+        session.add_user_message(input);
+        let prompt = session.render_prompt();
+        let outputs = engine.generate_formatted(&[prompt.as_str()], &sampling_params, true)?;
+        let reply = outputs
+            .into_iter()
+            .next()
+            .map(|output| output.text)
+            .unwrap_or_default();
+        let visible_reply = strip_think_blocks(&reply);
+
+        println!("\nassistant:\n{}\n", visible_reply);
+        session.add_assistant_message(visible_reply);
     }
 
     Ok(())
@@ -377,8 +551,14 @@ fn run_benchmark_py(args: BenchPyArgs) -> Result<()> {
         .collect();
 
     println!(
-        "Python-compatible benchmark config: num_seqs={}, max_input_len={}, max_output_len={}, warmup={}, iters={}, seed={}",
-        args.num_seqs, args.max_input_len, args.max_output_len, args.warmup, args.iters, args.seed
+        "Python-compatible benchmark config: num_seqs={}, max_input_len={}, max_output_len={}, warmup={}, iters={}, seed={}, quiet={}",
+        args.num_seqs,
+        args.max_input_len,
+        args.max_output_len,
+        args.warmup,
+        args.iters,
+        args.seed,
+        args.quiet
     );
 
     let warmup_prompt = SamplingParams::default();
@@ -390,8 +570,22 @@ fn run_benchmark_py(args: BenchPyArgs) -> Result<()> {
     let mut throughputs = Vec::with_capacity(args.iters);
     let total_tokens: usize = sampling_params.iter().map(|sp| sp.max_tokens).sum();
     for iter in 0..args.iters {
+        let progress_label = format!(
+            "Bench {}/{} | num_seqs={} | in<={} | out<={}",
+            iter + 1,
+            args.iters,
+            args.num_seqs,
+            args.max_input_len,
+            args.max_output_len
+        );
+        let progress =
+            (!args.quiet).then(|| ProgressConfig::new(progress_label, Duration::from_secs(1)));
         let started = Instant::now();
-        let _ = engine.generate_token_ids_batch(&prompt_token_ids, &sampling_params, false)?;
+        let _ = engine.generate_token_ids_batch_with_stats_and_progress(
+            &prompt_token_ids,
+            &sampling_params,
+            progress.as_ref(),
+        )?;
         let elapsed = started.elapsed().as_secs_f64();
         let throughput = total_tokens as f64 / elapsed;
         throughputs.push(throughput);

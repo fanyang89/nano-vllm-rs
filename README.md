@@ -36,6 +36,21 @@ Built-in REPL commands:
 - `/clear`: clear the conversation history and keep the `--system` prompt
 - `/exit`: leave the REPL
 
+## Chat REPL
+
+Start an interactive multi-turn chat session with optional system prompt:
+
+```bash
+cargo run --release -- repl --device cpu --model ./models/Qwen3-0.6B --system "You are a concise assistant."
+```
+
+Built-in REPL commands:
+- `/history`: print the current conversation history
+- `/clear`: clear the conversation history and keep the `--system` prompt
+- `/exit`: leave the REPL
+
+The current REPL keeps context by replaying the full transcript each turn. It does not yet persist KV cache across turns.
+
 ## Benchmark
 
 Use the built-in `bench` subcommand to measure both latency and throughput with structured CSV-like output:

@@ -220,7 +220,7 @@ mod tests {
         let mut seq2 = make_seq(vec![1, 2, 3, 4, 7, 8], block_size);
         bm.allocate(&mut seq2);
         assert_eq!(seq2.num_cached_tokens, 4); // first block is cached
-                                               // seq2's first block should be the same as seq1's
+        // seq2's first block should be the same as seq1's
         assert_eq!(seq1.block_table[0], seq2.block_table[0]);
     }
 
