@@ -42,4 +42,4 @@ tasks:
         esac
         SHIM
       - chmod +x {{.HIPSIM_DIR}}/hipconfig
-      - cargo run --release --features rocm -- run --model {{.MODEL}} --device rocm --prompt "{{.PROMPT}}"
+      - cargo run --release --features rocm -- run --model {{.MODEL}} --device rocm --prompt "{{.PROMPT}}" --greedy
