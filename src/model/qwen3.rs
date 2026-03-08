@@ -1,13 +1,14 @@
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{anyhow, ensure, Context, Result};
 use burn::tensor::activation::silu;
 use burn::tensor::{Int, Tensor, TensorData};
 use burn_dispatch::{Dispatch, DispatchDevice};
-use safetensors::{Dtype, SafeTensors, tensor::TensorView};
+use safetensors::{tensor::TensorView, Dtype, SafeTensors};
 
 use crate::config::ModelConfig;
 use crate::layers::attention::Attention;
 use crate::layers::rotary_embedding::RotaryEmbedding;
 use crate::utils::context::AttentionContext;
+use crate::utils::profiler::Scope;
 
 struct LayerWeights {
     qkv_proj_w: Tensor<Dispatch, 2>, // [q+kv+kv, hidden]
@@ -167,7 +168,9 @@ impl Qwen3ForCausalLM {
                 )
             };
 
+            let _scope = Scope::new("layer_qkv_proj");
             let qkv = linear_2d(&normed, &layer.qkv_proj_w);
+            drop(_scope);
             let (mut q, mut k, v) = split_qkv(
                 &qkv,
                 layer.q_size,
@@ -182,19 +185,27 @@ impl Qwen3ForCausalLM {
                 k = rms_norm_3d(&k, kn, self.rms_norm_eps)?;
             }
 
+            let _scope = Scope::new("layer_rope");
             let (q, k) = layer.rotary.forward(positions, &q, &k)?;
+            drop(_scope);
+            let _scope = Scope::new("layer_attention");
             let o = layer
                 .attn
                 .forward(&q, &k, &v, &mut k_caches[i], &mut v_caches[i], ctx)?;
+            drop(_scope);
             let n = o.shape().as_slice()[0];
             let o = o.reshape([n, layer.num_heads * layer.head_dim]);
+            let _scope = Scope::new("layer_o_proj");
             let attn_out = linear_2d(&o, &layer.o_proj_w);
+            drop(_scope);
 
             let x = attn_out + new_residual.clone();
             let normed = rms_norm_2d(&x, &layer.post_ln_w, self.rms_norm_eps)?;
+            let _scope = Scope::new("layer_mlp");
             let gate_up = linear_2d(&normed, &layer.gate_up_w);
             let mlp_act = silu_and_mul_2d(&gate_up)?;
             let mlp_out = linear_2d(&mlp_act, &layer.down_proj_w);
+            drop(_scope);
 
             hidden_states = mlp_out;
             residual = Some(x);
@@ -216,11 +227,7 @@ impl Qwen3ForCausalLM {
         ctx: &AttentionContext,
     ) -> Result<Tensor<Dispatch, 2>> {
         let hidden = if ctx.is_prefill {
-            let cu: Vec<i32> = ctx
-                .cu_seqlens_q
-                .to_data()
-                .to_vec::<i32>()
-                .context("failed to read cu_seqlens_q")?;
+            let cu = &ctx.cu_seqlens_q_host;
             let batch = cu.len().saturating_sub(1);
             let mut indices = Vec::with_capacity(batch);
             for i in 0..batch {

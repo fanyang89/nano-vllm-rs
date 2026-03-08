@@ -65,14 +65,14 @@ tasks:
       - cargo run --release --features rocm -- run --model {{.MODEL}} --device rocm --prompt "{{.PROMPT}}" --greedy
 
   bench-rocm:
-    desc: Benchmark ROCm throughput/latency with cubecl hipconfig shim
+    desc: Benchmark ROCm throughput by sweeping decode concurrency with cubecl hipconfig shim
     vars:
       MODEL: ./models/Qwen3-0.6B
       PROMPT: "Hello"
       WARMUP: 1
-      ITERS: 5
-      MAX_TOKENS: 128
-      REPEAT: 1
+      ITERS: 1
+      MAX_TOKENS: 32
+      THROUGHPUT_REPEATS: 1,2,4,8,16
       HIP_PATH: /opt/rocm-7.2.0
       HIPSIM_DIR: /tmp/hipshim
       ROCM_TARGET_DIR: target/rocm
@@ -93,4 +93,10 @@ tasks:
         esac
         SHIM
       - chmod +x {{.HIPSIM_DIR}}/hipconfig
-      - cargo run --release --features rocm -- bench --model {{.MODEL}} --device rocm --prompt "{{.PROMPT}}" --greedy --warmup {{.WARMUP}} --iters {{.ITERS}} --max-tokens {{.MAX_TOKENS}} --repeat-prompt {{.REPEAT}}
+      - >
+        cargo run --release --features rocm --
+        bench --model {{.MODEL}} --device rocm
+        --prompt "{{.PROMPT}}"
+        --greedy --ignore-eos --warmup {{.WARMUP}}
+        --iters {{.ITERS}} --max-tokens {{.MAX_TOKENS}}
+        --throughput-repeats {{.THROUGHPUT_REPEATS}}

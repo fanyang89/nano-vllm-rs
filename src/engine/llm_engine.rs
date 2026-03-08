@@ -11,6 +11,7 @@ use crate::engine::model_runner::ModelRunner;
 use crate::engine::scheduler::Scheduler;
 use crate::engine::sequence::Sequence;
 use crate::sampling_params::SamplingParams;
+use crate::utils::profiler;
 
 pub struct GenerationOutput {
     pub text: String,
@@ -172,6 +173,8 @@ impl LLMEngine {
         sampling_params: &SamplingParams,
         use_tqdm: bool,
     ) -> Result<(Vec<GenerationOutput>, GenerationStats)> {
+        profiler::reset();
+
         for prompt in prompts {
             self.add_request(prompt, sampling_params)?;
         }
@@ -274,6 +277,10 @@ impl LLMEngine {
                 GenerationOutput { text, token_ids }
             })
             .collect();
+
+        if let Some(report) = profiler::report() {
+            println!("{report}");
+        }
 
         Ok((results, stats))
     }
