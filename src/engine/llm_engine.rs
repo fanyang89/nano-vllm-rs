@@ -17,6 +17,18 @@ pub struct GenerationOutput {
     pub token_ids: Vec<u32>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct GenerationStats {
+    pub total_time_s: f64,
+    pub prefill_tokens: u64,
+    pub prefill_time_s: f64,
+    pub decode_tokens: u64,
+    pub decode_time_s: f64,
+    pub decode_steady_tokens: u64,
+    pub decode_steady_time_s: f64,
+    pub first_decode_latency_s: Option<f64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeDevice {
     Cpu,
@@ -150,10 +162,21 @@ impl LLMEngine {
         sampling_params: &SamplingParams,
         use_tqdm: bool,
     ) -> Result<Vec<GenerationOutput>> {
+        let (outputs, _stats) = self.generate_with_stats(prompts, sampling_params, use_tqdm)?;
+        Ok(outputs)
+    }
+
+    pub fn generate_with_stats(
+        &mut self,
+        prompts: &[&str],
+        sampling_params: &SamplingParams,
+        use_tqdm: bool,
+    ) -> Result<(Vec<GenerationOutput>, GenerationStats)> {
         for prompt in prompts {
             self.add_request(prompt, sampling_params)?;
         }
 
+        let total_start = Instant::now();
         let pb = if use_tqdm {
             let total_tokens = prompts.len().saturating_mul(sampling_params.max_tokens) as u64;
             let pb = ProgressBar::new(total_tokens);
@@ -169,12 +192,7 @@ impl LLMEngine {
         };
 
         let mut outputs: HashMap<usize, Vec<u32>> = HashMap::new();
-        let mut prefill_tokens_total = 0u64;
-        let mut prefill_time_total = 0.0f64;
-        let mut decode_tokens_total = 0u64;
-        let mut decode_time_total = 0.0f64;
-        let mut decode_tokens_steady = 0u64;
-        let mut decode_time_steady = 0.0f64;
+        let mut stats = GenerationStats::default();
         let mut seen_decode_step = false;
         let mut last_pb_update = Instant::now();
 
@@ -184,17 +202,18 @@ impl LLMEngine {
             let elapsed = t.elapsed().as_secs_f64();
 
             if num_tokens > 0 {
-                prefill_tokens_total += num_tokens as u64;
-                prefill_time_total += elapsed;
+                stats.prefill_tokens += num_tokens as u64;
+                stats.prefill_time_s += elapsed;
             } else {
                 let decode_tokens = (-num_tokens) as u64;
-                decode_tokens_total += decode_tokens;
-                decode_time_total += elapsed;
+                stats.decode_tokens += decode_tokens;
+                stats.decode_time_s += elapsed;
                 if seen_decode_step {
-                    decode_tokens_steady += decode_tokens;
-                    decode_time_steady += elapsed;
+                    stats.decode_steady_tokens += decode_tokens;
+                    stats.decode_steady_time_s += elapsed;
                 } else {
                     seen_decode_step = true;
+                    stats.first_decode_latency_s = Some(total_start.elapsed().as_secs_f64());
                 }
             }
 
@@ -209,18 +228,18 @@ impl LLMEngine {
 
             if let Some(pb) = &pb {
                 if last_pb_update.elapsed().as_millis() >= 100 {
-                    let prefill_tps = if prefill_time_total > 0.0 {
-                        prefill_tokens_total as f64 / prefill_time_total
+                    let prefill_tps = if stats.prefill_time_s > 0.0 {
+                        stats.prefill_tokens as f64 / stats.prefill_time_s
                     } else {
                         0.0
                     };
-                    let decode_tps = if decode_time_total > 0.0 {
-                        decode_tokens_total as f64 / decode_time_total
+                    let decode_tps = if stats.decode_time_s > 0.0 {
+                        stats.decode_tokens as f64 / stats.decode_time_s
                     } else {
                         0.0
                     };
-                    let decode_steady_tps = if decode_time_steady > 0.0 {
-                        decode_tokens_steady as f64 / decode_time_steady
+                    let decode_steady_tps = if stats.decode_steady_time_s > 0.0 {
+                        stats.decode_steady_tokens as f64 / stats.decode_steady_time_s
                     } else {
                         decode_tps
                     };
@@ -242,6 +261,7 @@ impl LLMEngine {
             }
             pb.finish();
         }
+        stats.total_time_s = total_start.elapsed().as_secs_f64();
 
         // Sort by seq_id and decode
         let mut sorted: Vec<_> = outputs.into_iter().collect();
@@ -255,7 +275,7 @@ impl LLMEngine {
             })
             .collect();
 
-        Ok(results)
+        Ok((results, stats))
     }
 }
 

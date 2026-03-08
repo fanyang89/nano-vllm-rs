@@ -17,6 +17,26 @@ tasks:
     cmds:
       - cargo run --release -- convert-model --model {{.MODEL}} --out {{.OUT}}
 
+  run-cpu:
+    desc: Run inference on CPU
+    vars:
+      PROMPT: "Hello"
+      MODEL: ./models/Qwen3-0.6B
+    cmds:
+      - cargo run --release -- run --model {{.MODEL}} --device cpu --prompt "{{.PROMPT}}" --greedy
+
+  bench-cpu:
+    desc: Benchmark CPU throughput/latency
+    vars:
+      PROMPT: "Hello"
+      MODEL: ./models/Qwen3-0.6B
+      WARMUP: 1
+      ITERS: 5
+      MAX_TOKENS: 128
+      REPEAT: 1
+    cmds:
+      - cargo run --release -- bench --model {{.MODEL}} --device cpu --prompt "{{.PROMPT}}" --greedy --warmup {{.WARMUP}} --iters {{.ITERS}} --max-tokens {{.MAX_TOKENS}} --repeat-prompt {{.REPEAT}}
+
   run-rocm:
     desc: Run inference on ROCm with cubecl hipconfig shim
     vars:
@@ -43,3 +63,34 @@ tasks:
         SHIM
       - chmod +x {{.HIPSIM_DIR}}/hipconfig
       - cargo run --release --features rocm -- run --model {{.MODEL}} --device rocm --prompt "{{.PROMPT}}" --greedy
+
+  bench-rocm:
+    desc: Benchmark ROCm throughput/latency with cubecl hipconfig shim
+    vars:
+      MODEL: ./models/Qwen3-0.6B
+      PROMPT: "Hello"
+      WARMUP: 1
+      ITERS: 5
+      MAX_TOKENS: 128
+      REPEAT: 1
+      HIP_PATH: /opt/rocm-7.2.0
+      HIPSIM_DIR: /tmp/hipshim
+      ROCM_TARGET_DIR: target/rocm
+    env:
+      HIP_PATH: "{{.HIP_PATH}}"
+      CARGO_TARGET_DIR: "{{.ROCM_TARGET_DIR}}"
+      PATH: "{{.HIPSIM_DIR}}:{{env \"PATH\"}}"
+    cmds:
+      - mkdir -p {{.HIPSIM_DIR}}
+      - |
+        cat > {{.HIPSIM_DIR}}/hipconfig <<'SHIM'
+        #!/usr/bin/env bash
+        case "$1" in
+          --version) echo "7.2.52802-fc0010cf6a" ;;
+          -R) echo "{{.HIP_PATH}}" ;;
+          -p) echo "{{.HIP_PATH}}" ;;
+          *) /usr/bin/hipconfig "$@" ;;
+        esac
+        SHIM
+      - chmod +x {{.HIPSIM_DIR}}/hipconfig
+      - cargo run --release --features rocm -- bench --model {{.MODEL}} --device rocm --prompt "{{.PROMPT}}" --greedy --warmup {{.WARMUP}} --iters {{.ITERS}} --max-tokens {{.MAX_TOKENS}} --repeat-prompt {{.REPEAT}}
