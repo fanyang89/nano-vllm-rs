@@ -1,5 +1,5 @@
-use anyhow::{ensure, Context, Result};
-use burn::tensor::{backend::Backend, DType, Tensor};
+use anyhow::{Context, Result, ensure};
+use burn::tensor::{DType, Tensor, backend::Backend};
 use rand::Rng;
 
 /// Temperature-based token sampling using the Gumbel-max trick.

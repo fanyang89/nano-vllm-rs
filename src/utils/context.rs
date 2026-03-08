@@ -1,4 +1,4 @@
-use burn::tensor::{backend::Backend, Int, Tensor};
+use burn::tensor::{Int, Tensor, backend::Backend};
 
 /// Context passed through the model forward pass to attention layers.
 pub struct AttentionContext<B: Backend> {

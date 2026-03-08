@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use anyhow::{ensure, Result};
-use burn::tensor::{backend::Backend, IndexingUpdateOp, Int, Tensor};
+use anyhow::{Result, ensure};
+use burn::tensor::{IndexingUpdateOp, Int, Tensor, backend::Backend};
 
 #[derive(Debug)]
 struct TailState<B: Backend> {

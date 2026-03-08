@@ -1,6 +1,6 @@
 use anyhow::Result;
 use burn::tensor::activation::softmax;
-use burn::tensor::{backend::Backend, DType, Element, Int, Tensor};
+use burn::tensor::{DType, Element, Int, Tensor, backend::Backend};
 
 use crate::engine::kv_cache::KvCache;
 use crate::utils::context::AttentionContext;

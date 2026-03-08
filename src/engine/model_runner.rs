@@ -1,5 +1,5 @@
 use anyhow::Result;
-use burn::tensor::{backend::Backend, Int, Tensor, TensorData};
+use burn::tensor::{Int, Tensor, TensorData, backend::Backend};
 
 use crate::config::{EngineConfig, ModelConfig};
 use crate::engine::kv_cache::KvCache;

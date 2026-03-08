@@ -1,5 +1,5 @@
-use anyhow::{ensure, Result};
-use burn::tensor::{backend::Backend, DType, Element, Int, Tensor, TensorData};
+use anyhow::{Result, ensure};
+use burn::tensor::{DType, Element, Int, Tensor, TensorData, backend::Backend};
 
 pub struct RotaryEmbedding<B: Backend> {
     head_dim: usize,
