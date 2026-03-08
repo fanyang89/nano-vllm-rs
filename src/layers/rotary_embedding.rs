@@ -31,9 +31,15 @@ impl RotaryEmbedding {
     ) -> Result<(Tensor<Dispatch, 3>, Tensor<Dispatch, 3>)> {
         let q_shape = q.shape().as_slice().to_vec();
         let k_shape = k.shape().as_slice().to_vec();
-        ensure!(q_shape.len() == 3 && k_shape.len() == 3, "q/k must be rank-3");
+        ensure!(
+            q_shape.len() == 3 && k_shape.len() == 3,
+            "q/k must be rank-3"
+        );
         ensure!(q_shape[0] == k_shape[0], "q/k token dim mismatch");
-        ensure!(q_shape[2] == self.head_dim && k_shape[2] == self.head_dim, "head_dim mismatch");
+        ensure!(
+            q_shape[2] == self.head_dim && k_shape[2] == self.head_dim,
+            "head_dim mismatch"
+        );
 
         let n = q_shape[0];
         let hd = self.head_dim;

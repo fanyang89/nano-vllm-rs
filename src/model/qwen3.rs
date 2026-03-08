@@ -14,7 +14,7 @@ struct LayerWeights {
     o_proj_w: Tensor<Dispatch, 2>,   // [hidden, q]
     q_norm_w: Option<Tensor<Dispatch, 1>>,
     k_norm_w: Option<Tensor<Dispatch, 1>>,
-    gate_up_w: Tensor<Dispatch, 2>, // [2*inter, hidden]
+    gate_up_w: Tensor<Dispatch, 2>,   // [2*inter, hidden]
     down_proj_w: Tensor<Dispatch, 2>, // [hidden, inter]
     input_ln_w: Tensor<Dispatch, 1>,
     post_ln_w: Tensor<Dispatch, 1>,
@@ -100,8 +100,13 @@ impl Qwen3ForCausalLM {
                 gate_up_w,
                 down_proj_w: repo.tensor2(&format!("{base}.mlp.down_proj.weight"), device)?,
                 input_ln_w: repo.tensor1(&format!("{base}.input_layernorm.weight"), device)?,
-                post_ln_w: repo.tensor1(&format!("{base}.post_attention_layernorm.weight"), device)?,
-                attn: Attention::new(config.num_attention_heads, config.num_key_value_heads, head_dim),
+                post_ln_w: repo
+                    .tensor1(&format!("{base}.post_attention_layernorm.weight"), device)?,
+                attn: Attention::new(
+                    config.num_attention_heads,
+                    config.num_key_value_heads,
+                    head_dim,
+                ),
                 rotary: RotaryEmbedding::new(
                     head_dim,
                     config.max_position_embeddings,
@@ -139,8 +144,14 @@ impl Qwen3ForCausalLM {
         v_caches: &mut [Tensor<Dispatch, 4>],
         ctx: &AttentionContext,
     ) -> Result<Tensor<Dispatch, 2>> {
-        ensure!(k_caches.len() == self.layers.len(), "k cache layer mismatch");
-        ensure!(v_caches.len() == self.layers.len(), "v cache layer mismatch");
+        ensure!(
+            k_caches.len() == self.layers.len(),
+            "k cache layer mismatch"
+        );
+        ensure!(
+            v_caches.len() == self.layers.len(),
+            "v cache layer mismatch"
+        );
 
         let mut hidden_states = self.embed_tokens.clone().select(0, input_ids.clone());
         let mut residual: Option<Tensor<Dispatch, 2>> = None;
@@ -236,12 +247,19 @@ fn linear_2d(x: &Tensor<Dispatch, 2>, w_out_in: &Tensor<Dispatch, 2>) -> Tensor<
     x.clone().matmul(w_out_in.clone().transpose())
 }
 
-fn rms_norm_2d(x: &Tensor<Dispatch, 2>, weight: &Tensor<Dispatch, 1>, eps: f64) -> Result<Tensor<Dispatch, 2>> {
+fn rms_norm_2d(
+    x: &Tensor<Dispatch, 2>,
+    weight: &Tensor<Dispatch, 1>,
+    eps: f64,
+) -> Result<Tensor<Dispatch, 2>> {
     let shape = x.shape();
     let dims = shape.as_slice();
     ensure!(dims.len() == 2, "rms_norm_2d expects rank-2");
     let h = dims[1];
-    ensure!(weight.shape().as_slice() == [h], "rms_norm_2d weight mismatch");
+    ensure!(
+        weight.shape().as_slice() == [h],
+        "rms_norm_2d weight mismatch"
+    );
     let inv = x
         .clone()
         .powf_scalar(2.0)
@@ -253,11 +271,18 @@ fn rms_norm_2d(x: &Tensor<Dispatch, 2>, weight: &Tensor<Dispatch, 1>, eps: f64) 
     Ok(x.clone() * inv * w)
 }
 
-fn rms_norm_3d(x: &Tensor<Dispatch, 3>, weight: &Tensor<Dispatch, 1>, eps: f64) -> Result<Tensor<Dispatch, 3>> {
+fn rms_norm_3d(
+    x: &Tensor<Dispatch, 3>,
+    weight: &Tensor<Dispatch, 1>,
+    eps: f64,
+) -> Result<Tensor<Dispatch, 3>> {
     let dims = x.shape().as_slice().to_vec();
     ensure!(dims.len() == 3, "rms_norm_3d expects rank-3");
     let d = dims[2];
-    ensure!(weight.shape().as_slice() == [d], "rms_norm_3d weight mismatch");
+    ensure!(
+        weight.shape().as_slice() == [d],
+        "rms_norm_3d weight mismatch"
+    );
     let inv = x
         .clone()
         .powf_scalar(2.0)
@@ -265,10 +290,7 @@ fn rms_norm_3d(x: &Tensor<Dispatch, 3>, weight: &Tensor<Dispatch, 1>, eps: f64) 
         .add_scalar(eps as f32)
         .sqrt()
         .recip();
-    let w = weight
-        .clone()
-        .unsqueeze_dim::<2>(0)
-        .unsqueeze_dim::<3>(0);
+    let w = weight.clone().unsqueeze_dim::<2>(0).unsqueeze_dim::<3>(0);
     Ok(x.clone() * inv * w)
 }
 
@@ -291,7 +313,11 @@ fn split_qkv(
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-) -> Result<(Tensor<Dispatch, 3>, Tensor<Dispatch, 3>, Tensor<Dispatch, 3>)> {
+) -> Result<(
+    Tensor<Dispatch, 3>,
+    Tensor<Dispatch, 3>,
+    Tensor<Dispatch, 3>,
+)> {
     let dims = qkv.shape().as_slice().to_vec();
     ensure!(dims.len() == 2, "qkv must be rank-2");
     let n = dims[0];
@@ -358,9 +384,15 @@ impl SafetensorRepo {
     }
 }
 
-fn tensor_from_view_1d(view: TensorView<'_>, device: &DispatchDevice) -> Result<Tensor<Dispatch, 1>> {
+fn tensor_from_view_1d(
+    view: TensorView<'_>,
+    device: &DispatchDevice,
+) -> Result<Tensor<Dispatch, 1>> {
     let shape = view.shape().to_vec();
-    ensure!(shape.len() == 1, "expected rank-1 tensor, got shape {shape:?}");
+    ensure!(
+        shape.len() == 1,
+        "expected rank-1 tensor, got shape {shape:?}"
+    );
     let data = view_to_f32_vec(view)?;
     Ok(Tensor::<Dispatch, 1>::from_data(
         TensorData::new(data, [shape[0]]),
@@ -368,9 +400,15 @@ fn tensor_from_view_1d(view: TensorView<'_>, device: &DispatchDevice) -> Result<
     ))
 }
 
-fn tensor_from_view_2d(view: TensorView<'_>, device: &DispatchDevice) -> Result<Tensor<Dispatch, 2>> {
+fn tensor_from_view_2d(
+    view: TensorView<'_>,
+    device: &DispatchDevice,
+) -> Result<Tensor<Dispatch, 2>> {
     let shape = view.shape().to_vec();
-    ensure!(shape.len() == 2, "expected rank-2 tensor, got shape {shape:?}");
+    ensure!(
+        shape.len() == 2,
+        "expected rank-2 tensor, got shape {shape:?}"
+    );
     let data = view_to_f32_vec(view)?;
     Ok(Tensor::<Dispatch, 2>::from_data(
         TensorData::new(data, [shape[0], shape[1]]),

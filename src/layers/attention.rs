@@ -64,7 +64,9 @@ impl Attention {
             let k_end = cu_seqlens_k[i + 1] as usize;
             let k_len = k_end.saturating_sub(k_start);
 
-            let q_i = q.clone().slice([q_start..q_end, 0..self.num_heads, 0..self.head_dim]);
+            let q_i = q
+                .clone()
+                .slice([q_start..q_end, 0..self.num_heads, 0..self.head_dim]);
 
             let (k_i, v_i) = if has_prefix_cache {
                 self.gather_kv_from_cache(
@@ -182,9 +184,7 @@ impl Attention {
         let qh = q.clone().swap_dims(0, 1);
         let kh = k.clone().swap_dims(0, 1);
         let vh = v.clone().swap_dims(0, 1);
-        let mut attn = qh
-            .matmul(kh.clone().swap_dims(1, 2))
-            .mul_scalar(self.scale);
+        let mut attn = qh.matmul(kh.clone().swap_dims(1, 2)).mul_scalar(self.scale);
 
         if causal && q_len > 1 {
             let mask = create_causal_mask(q_len, kv_len, &attn.device());
@@ -217,18 +217,13 @@ fn store_kvcache(
     let valid_mask = slots.clone().greater_equal_elem(0);
     slots = slots.clamp(0, (total_slots.saturating_sub(1)) as i32);
 
-    let indices = slots
-        .unsqueeze_dim::<2>(1)
-        .repeat(&[1, row_width]); // [n, row_width]
+    let indices = slots.unsqueeze_dim::<2>(1).repeat(&[1, row_width]); // [n, row_width]
     let valid = valid_mask
         .unsqueeze_dim::<2>(1)
         .repeat(&[1, row_width])
         .float();
 
-    let key_flat = key
-        .clone()
-        .reshape([n, row_width])
-        .mul(valid.clone());
+    let key_flat = key.clone().reshape([n, row_width]).mul(valid.clone());
     let val_flat = value.clone().reshape([n, row_width]).mul(valid.clone());
 
     let k_flat = k_cache.clone().reshape([total_slots, row_width]);
@@ -259,7 +254,11 @@ fn store_kvcache(
     Ok(())
 }
 
-fn create_causal_mask(q_len: usize, kv_len: usize, device: &burn_dispatch::DispatchDevice) -> Tensor<Dispatch, 3> {
+fn create_causal_mask(
+    q_len: usize,
+    kv_len: usize,
+    device: &burn_dispatch::DispatchDevice,
+) -> Tensor<Dispatch, 3> {
     let offset = (kv_len as i64 - q_len as i64) as i32;
     let q_idx = Tensor::<Dispatch, 1, Int>::arange(0..q_len as i64, device)
         .reshape([q_len, 1])
