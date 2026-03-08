@@ -3,11 +3,29 @@
 version: "3"
 
 tasks:
+  rocm-setup:
+    internal: true
+    vars:
+      HIP_PATH: /opt/rocm-7.2.0
+      HIPSIM_DIR: /tmp/hipshim
+    cmds:
+      - mkdir -p {{.HIPSIM_DIR}}
+      - |
+        cat > {{.HIPSIM_DIR}}/hipconfig <<'SHIM'
+        #!/usr/bin/env bash
+        case "$1" in
+          --version) echo "7.2.52802-fc0010cf6a" ;;
+          -R) echo "{{.HIP_PATH}}" ;;
+          -p) echo "{{.HIP_PATH}}" ;;
+          *) /usr/bin/hipconfig "$@" ;;
+        esac
+        SHIM
+      - chmod +x {{.HIPSIM_DIR}}/hipconfig
+
   download:
     desc: Download models
     cmds:
       - uvx hf download --local-dir ./models/Qwen3-0.6B Qwen/Qwen3-0.6B
-      - uvx hf download --local-dir ./models/Qwen3-Embedding-0.6B Qwen/Qwen3-Embedding-0.6B
 
   convert:
     desc: Build Qwen3 conversion plan from safetensors
@@ -17,157 +35,77 @@ tasks:
     cmds:
       - cargo run --release -- convert-model --model {{.MODEL}} --out {{.OUT}}
 
-  run-cpu:
-    desc: Run inference on CPU
-    vars:
-      PROMPT: "Hello"
-      MODEL: ./models/Qwen3-0.6B
-    cmds:
-      - cargo run --release -- run --model {{.MODEL}} --device cpu --prompt "{{.PROMPT}}" --greedy
-
-  run-rocm:
-    desc: Run inference on ROCm with cubecl hipconfig shim
+  run:
+    desc: Run inference on CPU or ROCm
     vars:
       MODEL: ./models/Qwen3-0.6B
       PROMPT: "Hello"
+      DEVICE: cpu
       HIP_PATH: /opt/rocm-7.2.0
       HIPSIM_DIR: /tmp/hipshim
       ROCM_TARGET_DIR: target/rocm
-    env:
-      HIP_PATH: "{{.HIP_PATH}}"
-      CARGO_TARGET_DIR: "{{.ROCM_TARGET_DIR}}"
-      PATH: "{{.HIPSIM_DIR}}:{{env \"PATH\"}}"
+      GREEDY_FLAG: ""
     cmds:
-      - mkdir -p {{.HIPSIM_DIR}}
       - |
-        cat > {{.HIPSIM_DIR}}/hipconfig <<'SHIM'
-        #!/usr/bin/env bash
-        case "$1" in
-          --version) echo "7.2.52802-fc0010cf6a" ;;
-          -R) echo "{{.HIP_PATH}}" ;;
-          -p) echo "{{.HIP_PATH}}" ;;
-          *) /usr/bin/hipconfig "$@" ;;
-        esac
-        SHIM
-      - chmod +x {{.HIPSIM_DIR}}/hipconfig
-      - cargo run --release --features rocm -- run --model {{.MODEL}} --device rocm --prompt "{{.PROMPT}}" --greedy
+        if [ "{{.DEVICE}}" = "rocm" ]; then
+          task rocm-setup HIP_PATH="{{.HIP_PATH}}" HIPSIM_DIR="{{.HIPSIM_DIR}}"
+          HIP_PATH="{{.HIP_PATH}}" \
+          CARGO_TARGET_DIR="{{.ROCM_TARGET_DIR}}" \
+          PATH="{{.HIPSIM_DIR}}:$PATH" \
+          cargo run --release --features rocm -- run --model {{.MODEL}} --device rocm --prompt "{{.PROMPT}}" {{.GREEDY_FLAG}}
+        else
+          cargo run --release -- run --model {{.MODEL}} --device cpu --prompt "{{.PROMPT}}" {{.GREEDY_FLAG}}
+        fi
+
+  bench-rocm-base:
+    internal: true
+    vars:
+      MODEL: ./models/Qwen3-0.6B
+      SEED: "0"
+      QUIET_FLAG: --quiet
+      HIP_PATH: /opt/rocm-7.2.0
+      HIPSIM_DIR: /tmp/hipshim
+      ROCM_TARGET_DIR: target/rocm
+    cmds:
+      - task: rocm-setup
+        vars:
+          HIP_PATH: "{{.HIP_PATH}}"
+          HIPSIM_DIR: "{{.HIPSIM_DIR}}"
+      - >
+        HIP_PATH="{{.HIP_PATH}}"
+        CARGO_TARGET_DIR="{{.ROCM_TARGET_DIR}}"
+        PATH="{{.HIPSIM_DIR}}:$PATH"
+        cargo run --release --features rocm --
+        bench --model {{.MODEL}} --device rocm
+        --num-seqs {{default "64" .NUM_SEQS}}
+        --max-input-len {{default "256" .MAX_INPUT_LEN}}
+        --max-output-len {{default "256" .MAX_OUTPUT_LEN}}
+        --warmup {{default "1" .WARMUP}} --iters {{default "1" .ITERS}} --seed {{.SEED}}
+        {{default "--quiet" .QUIET_FLAG}}
 
   bench-rocm-fast:
     desc: Run fast Python-compatible ROCm benchmark
-    vars:
-      MODEL: ./models/Qwen3-0.6B
-      NUM_SEQS: 8
-      MAX_INPUT_LEN: 64
-      MAX_OUTPUT_LEN: 64
-      WARMUP: 0
-      ITERS: 1
-      SEED: 0
-      QUIET_FLAG: --quiet
-      HIP_PATH: /opt/rocm-7.2.0
-      HIPSIM_DIR: /tmp/hipshim
-      ROCM_TARGET_DIR: target/rocm
-    env:
-      HIP_PATH: "{{.HIP_PATH}}"
-      CARGO_TARGET_DIR: "{{.ROCM_TARGET_DIR}}"
-      PATH: "{{.HIPSIM_DIR}}:{{env \"PATH\"}}"
     cmds:
-      - mkdir -p {{.HIPSIM_DIR}}
-      - |
-        cat > {{.HIPSIM_DIR}}/hipconfig <<'SHIM'
-        #!/usr/bin/env bash
-        case "$1" in
-          --version) echo "7.2.52802-fc0010cf6a" ;;
-          -R) echo "{{.HIP_PATH}}" ;;
-          -p) echo "{{.HIP_PATH}}" ;;
-          *) /usr/bin/hipconfig "$@" ;;
-        esac
-        SHIM
-      - chmod +x {{.HIPSIM_DIR}}/hipconfig
-      - >
-        cargo run --release --features rocm --
-        bench --model {{.MODEL}} --device rocm
-        --num-seqs {{.NUM_SEQS}}
-        --max-input-len {{.MAX_INPUT_LEN}}
-        --max-output-len {{.MAX_OUTPUT_LEN}}
-        --warmup {{.WARMUP}} --iters {{.ITERS}} --seed {{.SEED}}
-        {{.QUIET_FLAG}}
+      - task: bench-rocm-base
+        vars:
+          NUM_SEQS: "8"
+          MAX_INPUT_LEN: "64"
+          MAX_OUTPUT_LEN: "64"
+          WARMUP: "0"
+          ITERS: "1"
 
   bench-rocm:
     desc: Run normal Python-compatible ROCm benchmark
-    vars:
-      MODEL: ./models/Qwen3-0.6B
-      NUM_SEQS: 64
-      MAX_INPUT_LEN: 256
-      MAX_OUTPUT_LEN: 256
-      WARMUP: 1
-      ITERS: 1
-      SEED: 0
-      QUIET_FLAG: --quiet
-      HIP_PATH: /opt/rocm-7.2.0
-      HIPSIM_DIR: /tmp/hipshim
-      ROCM_TARGET_DIR: target/rocm
-    env:
-      HIP_PATH: "{{.HIP_PATH}}"
-      CARGO_TARGET_DIR: "{{.ROCM_TARGET_DIR}}"
-      PATH: "{{.HIPSIM_DIR}}:{{env \"PATH\"}}"
     cmds:
-      - mkdir -p {{.HIPSIM_DIR}}
-      - |
-        cat > {{.HIPSIM_DIR}}/hipconfig <<'SHIM'
-        #!/usr/bin/env bash
-        case "$1" in
-          --version) echo "7.2.52802-fc0010cf6a" ;;
-          -R) echo "{{.HIP_PATH}}" ;;
-          -p) echo "{{.HIP_PATH}}" ;;
-          *) /usr/bin/hipconfig "$@" ;;
-        esac
-        SHIM
-      - chmod +x {{.HIPSIM_DIR}}/hipconfig
-      - >
-        cargo run --release --features rocm --
-        bench --model {{.MODEL}} --device rocm
-        --num-seqs {{.NUM_SEQS}}
-        --max-input-len {{.MAX_INPUT_LEN}}
-        --max-output-len {{.MAX_OUTPUT_LEN}}
-        --warmup {{.WARMUP}} --iters {{.ITERS}} --seed {{.SEED}}
-        {{.QUIET_FLAG}}
+      - task: bench-rocm-base
 
   bench-rocm-heavy:
     desc: Run heavy Python-compatible ROCm benchmark
-    vars:
-      MODEL: ./models/Qwen3-0.6B
-      NUM_SEQS: 256
-      MAX_INPUT_LEN: 1024
-      MAX_OUTPUT_LEN: 1024
-      WARMUP: 1
-      ITERS: 3
-      SEED: 0
-      QUIET_FLAG: --quiet
-      HIP_PATH: /opt/rocm-7.2.0
-      HIPSIM_DIR: /tmp/hipshim
-      ROCM_TARGET_DIR: target/rocm
-    env:
-      HIP_PATH: "{{.HIP_PATH}}"
-      CARGO_TARGET_DIR: "{{.ROCM_TARGET_DIR}}"
-      PATH: "{{.HIPSIM_DIR}}:{{env \"PATH\"}}"
     cmds:
-      - mkdir -p {{.HIPSIM_DIR}}
-      - |
-        cat > {{.HIPSIM_DIR}}/hipconfig <<'SHIM'
-        #!/usr/bin/env bash
-        case "$1" in
-          --version) echo "7.2.52802-fc0010cf6a" ;;
-          -R) echo "{{.HIP_PATH}}" ;;
-          -p) echo "{{.HIP_PATH}}" ;;
-          *) /usr/bin/hipconfig "$@" ;;
-        esac
-        SHIM
-      - chmod +x {{.HIPSIM_DIR}}/hipconfig
-      - >
-        cargo run --release --features rocm --
-        bench --model {{.MODEL}} --device rocm
-        --num-seqs {{.NUM_SEQS}}
-        --max-input-len {{.MAX_INPUT_LEN}}
-        --max-output-len {{.MAX_OUTPUT_LEN}}
-        --warmup {{.WARMUP}} --iters {{.ITERS}} --seed {{.SEED}}
-        {{.QUIET_FLAG}}
+      - task: bench-rocm-base
+        vars:
+          NUM_SEQS: "256"
+          MAX_INPUT_LEN: "1024"
+          MAX_OUTPUT_LEN: "1024"
+          WARMUP: "1"
+          ITERS: "3"
