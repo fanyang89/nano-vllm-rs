@@ -1,6 +1,6 @@
 use anyhow::{ensure, Result};
 use burn::tensor::activation::softmax;
-use burn::tensor::{backend::Backend, IndexingUpdateOp, Int, Tensor};
+use burn::tensor::{backend::Backend, DType, Element, IndexingUpdateOp, Int, Tensor};
 
 use crate::utils::context::AttentionContext;
 use crate::utils::profiler::Scope;
@@ -110,6 +110,15 @@ impl Attention {
             .expect("decode requires kv_slot_indices");
 
         let batch_size = q.shape().as_slice()[0];
+        if batch_size == 1 {
+            let ctx_len = context_lens[0] as usize;
+            debug_assert_eq!(kv_slot_indices[0].shape().as_slice()[0], ctx_len);
+            let _scope = Scope::new("decode_gather_kv");
+            let (k_i, v_i) = self.gather_kv_from_cache(k_cache, v_cache, &kv_slot_indices[0])?;
+            drop(_scope);
+            return self.scaled_dot_product_attention(q, &k_i, &v_i, false);
+        }
+
         let max_ctx_len = context_lens.iter().copied().max().unwrap_or(0) as usize;
         let device = q.device();
         let mut k_batch = Vec::with_capacity(batch_size);
@@ -184,10 +193,12 @@ impl Attention {
         let mask = Tensor::<B, 4>::from_data(
             burn::tensor::TensorData::new(mask, [batch_size, 1, 1, kv_len]),
             &attn.device(),
-        );
-        attn = attn + mask;
+        )
+        .cast(DType::F32);
+        let native_dtype = <B::FloatElem as Element>::dtype();
+        attn = attn.cast(DType::F32) + mask;
 
-        let attn = softmax(attn, 3).unsqueeze_dim::<5>(4);
+        let attn = softmax(attn, 3).cast(native_dtype).unsqueeze_dim::<5>(4);
         let out = (attn * vg).sum_dim(3).squeeze_dim::<4>(3);
         Ok(out.reshape([batch_size, self.num_heads, self.head_dim]))
     }
@@ -254,13 +265,15 @@ impl Attention {
         let kh = k.clone().swap_dims(0, 1);
         let vh = v.clone().swap_dims(0, 1);
         let mut attn = qh.matmul(kh.clone().swap_dims(1, 2)).mul_scalar(self.scale);
+        let native_dtype = <B::FloatElem as Element>::dtype();
+        attn = attn.cast(DType::F32);
 
         if causal && q_len > 1 {
-            let mask = create_causal_mask(q_len, kv_len, &attn.device());
+            let mask = create_causal_mask::<B>(q_len, kv_len, &attn.device()).cast(DType::F32);
             attn = attn + mask;
         }
 
-        let attn = softmax(attn, 2);
+        let attn = softmax(attn, 2).cast(native_dtype);
         let out = attn.matmul(vh); // [h, q, d]
         Ok(out.swap_dims(0, 1)) // [q, h, d]
     }

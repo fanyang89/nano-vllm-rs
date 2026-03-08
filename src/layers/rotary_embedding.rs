@@ -1,5 +1,5 @@
 use anyhow::{ensure, Result};
-use burn::tensor::{backend::Backend, Int, Tensor, TensorData};
+use burn::tensor::{backend::Backend, DType, Element, Int, Tensor, TensorData};
 
 pub struct RotaryEmbedding<B: Backend> {
     head_dim: usize,
@@ -50,17 +50,20 @@ impl<B: Backend> RotaryEmbedding<B> {
         let n = q_shape[0];
         let hd = self.head_dim;
         let half = hd / 2;
+        let native_dtype = <B::FloatElem as Element>::dtype();
 
-        // Clamp positions to configured max range before angle construction.
         let pos = positions
             .clone()
             .clamp(0, self.max_position_embeddings.saturating_sub(1) as i32)
             .float()
             .reshape([n, 1]);
-        let angles = pos.matmul(self.inv_freq.clone().unsqueeze_dim::<2>(0)); // [n, half]
+        let inv_freq = self.inv_freq.clone().cast(DType::F32);
+        let angles = pos.matmul(inv_freq.unsqueeze_dim::<2>(0));
         let cos = angles.clone().cos().unsqueeze_dim::<3>(1); // [n,1,half]
         let sin = angles.sin().unsqueeze_dim::<3>(1); // [n,1,half]
 
+        let q = q.clone().cast(DType::F32);
+        let k = k.clone().cast(DType::F32);
         let q1 = q.clone().slice([0..n, 0..q_shape[1], 0..half]);
         let q2 = q.clone().slice([0..n, 0..q_shape[1], half..hd]);
         let k1 = k.clone().slice([0..n, 0..k_shape[1], 0..half]);
@@ -71,8 +74,8 @@ impl<B: Backend> RotaryEmbedding<B> {
         let k_rot_1 = k1.clone() * cos.clone() - k2.clone() * sin.clone();
         let k_rot_2 = k2 * cos + k1 * sin;
 
-        let q_out = Tensor::<B, 3>::cat(vec![q_rot_1, q_rot_2], 2);
-        let k_out = Tensor::<B, 3>::cat(vec![k_rot_1, k_rot_2], 2);
+        let q_out = Tensor::<B, 3>::cat(vec![q_rot_1, q_rot_2], 2).cast(native_dtype);
+        let k_out = Tensor::<B, 3>::cat(vec![k_rot_1, k_rot_2], 2).cast(native_dtype);
         Ok((q_out, k_out))
     }
 }
