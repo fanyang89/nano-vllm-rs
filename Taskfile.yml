@@ -100,3 +100,41 @@ tasks:
         --greedy --ignore-eos --warmup {{.WARMUP}}
         --iters {{.ITERS}} --max-tokens {{.MAX_TOKENS}}
         --throughput-repeats {{.THROUGHPUT_REPEATS}}
+
+  bench-py-rocm:
+    desc: Run Python-compatible ROCm benchmark with random tokenized prompts
+    vars:
+      MODEL: ./models/Qwen3-0.6B
+      NUM_SEQS: 256
+      MAX_INPUT_LEN: 1024
+      MAX_OUTPUT_LEN: 1024
+      WARMUP: 1
+      ITERS: 3
+      SEED: 0
+      HIP_PATH: /opt/rocm-7.2.0
+      HIPSIM_DIR: /tmp/hipshim
+      ROCM_TARGET_DIR: target/rocm
+    env:
+      HIP_PATH: "{{.HIP_PATH}}"
+      CARGO_TARGET_DIR: "{{.ROCM_TARGET_DIR}}"
+      PATH: "{{.HIPSIM_DIR}}:{{env \"PATH\"}}"
+    cmds:
+      - mkdir -p {{.HIPSIM_DIR}}
+      - |
+        cat > {{.HIPSIM_DIR}}/hipconfig <<'SHIM'
+        #!/usr/bin/env bash
+        case "$1" in
+          --version) echo "7.2.52802-fc0010cf6a" ;;
+          -R) echo "{{.HIP_PATH}}" ;;
+          -p) echo "{{.HIP_PATH}}" ;;
+          *) /usr/bin/hipconfig "$@" ;;
+        esac
+        SHIM
+      - chmod +x {{.HIPSIM_DIR}}/hipconfig
+      - >
+        cargo run --release --features rocm --
+        bench-py --model {{.MODEL}} --device rocm
+        --num-seqs {{.NUM_SEQS}}
+        --max-input-len {{.MAX_INPUT_LEN}}
+        --max-output-len {{.MAX_OUTPUT_LEN}}
+        --warmup {{.WARMUP}} --iters {{.ITERS}} --seed {{.SEED}}

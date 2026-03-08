@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::Serialize;
 use tablestream::{Column, Stream};
 
@@ -22,6 +23,8 @@ enum Commands {
     Run(RunArgs),
     /// Run performance benchmarks
     Bench(BenchArgs),
+    /// Run benchmark compatible with nano-vllm/bench.py
+    BenchPy(BenchPyArgs),
     /// Build a deterministic Qwen3 weight remap plan from safetensors
     ConvertModel(ConvertModelArgs),
 }
@@ -121,6 +124,41 @@ struct BenchArgs {
     iters: usize,
 }
 
+#[derive(Parser, Debug)]
+struct BenchPyArgs {
+    /// Path to model directory (containing safetensors + config.json + tokenizer.json)
+    #[arg(long)]
+    model: String,
+
+    /// Runtime device to use
+    #[arg(long, value_enum)]
+    device: CliDevice,
+
+    /// Number of requests to issue in one batch
+    #[arg(long, default_value_t = 256)]
+    num_seqs: usize,
+
+    /// Maximum random prompt token length
+    #[arg(long, default_value_t = 1024)]
+    max_input_len: usize,
+
+    /// Maximum random output token length
+    #[arg(long, default_value_t = 1024)]
+    max_output_len: usize,
+
+    /// Warmup iterations before timed run
+    #[arg(long, default_value_t = 1)]
+    warmup: usize,
+
+    /// Timed iterations
+    #[arg(long, default_value_t = 1)]
+    iters: usize,
+
+    /// RNG seed
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+}
+
 #[derive(Debug, Serialize)]
 struct TensorEntry {
     source_key: String,
@@ -152,6 +190,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Run(args) => run_inference(args),
         Commands::Bench(args) => run_benchmark(args),
+        Commands::BenchPy(args) => run_benchmark_py(args),
         Commands::ConvertModel(args) => run_convert_model(args),
     }
 }
@@ -301,6 +340,77 @@ fn run_benchmark(args: BenchArgs) -> Result<()> {
     if is_sweep {
         print_throughput_sweep_table(&scenarios);
     }
+    Ok(())
+}
+
+fn run_benchmark_py(args: BenchPyArgs) -> Result<()> {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "Warning: debug build is slow for inference. Use `cargo run --release -- bench-py ...` for real performance."
+    );
+
+    tracing_subscriber::fmt::init();
+
+    println!("Loading model from: {}", args.model);
+    let runtime_device = match args.device {
+        CliDevice::Cpu => RuntimeDevice::Cpu,
+        CliDevice::Rocm => RuntimeDevice::Rocm,
+    };
+    let mut engine = LLMEngine::new(&args.model, runtime_device)?;
+
+    let mut rng = StdRng::seed_from_u64(args.seed);
+    let prompt_token_ids: Vec<Vec<u32>> = (0..args.num_seqs)
+        .map(|_| {
+            let len = rng.random_range(100..=args.max_input_len.max(100));
+            (0..len).map(|_| rng.random_range(0..=10_000u32)).collect()
+        })
+        .collect();
+    let sampling_params: Vec<SamplingParams> = (0..args.num_seqs)
+        .map(|_| {
+            SamplingParams::new(
+                0.6,
+                rng.random_range(100..=args.max_output_len.max(100)),
+                true,
+                true,
+            )
+        })
+        .collect();
+
+    println!(
+        "Python-compatible benchmark config: num_seqs={}, max_input_len={}, max_output_len={}, warmup={}, iters={}, seed={}",
+        args.num_seqs, args.max_input_len, args.max_output_len, args.warmup, args.iters, args.seed
+    );
+
+    let warmup_prompt = SamplingParams::default();
+    for i in 0..args.warmup {
+        let _ = engine.generate_with_stats(&["Benchmark: "], &warmup_prompt, false)?;
+        println!("Warmup {}/{} done", i + 1, args.warmup);
+    }
+
+    let mut throughputs = Vec::with_capacity(args.iters);
+    let total_tokens: usize = sampling_params.iter().map(|sp| sp.max_tokens).sum();
+    for iter in 0..args.iters {
+        let started = Instant::now();
+        let _ = engine.generate_token_ids_batch(&prompt_token_ids, &sampling_params, false)?;
+        let elapsed = started.elapsed().as_secs_f64();
+        let throughput = total_tokens as f64 / elapsed;
+        throughputs.push(throughput);
+        println!(
+            "Iter {}/{}: Total: {}tok, Time: {:.2}s, Throughput: {:.2}tok/s",
+            iter + 1,
+            args.iters,
+            total_tokens,
+            elapsed,
+            throughput
+        );
+    }
+
+    let mean = throughputs.iter().sum::<f64>() / throughputs.len() as f64;
+    println!(
+        "Mean throughput over {} iter(s): {:.2}tok/s",
+        throughputs.len(),
+        mean
+    );
     Ok(())
 }
 
