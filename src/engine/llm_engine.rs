@@ -219,6 +219,8 @@ impl<B: Backend<IntElem = i32>> LLMEngineImpl<B> {
         let token_ids = self.model_runner.run(&seq_refs, is_prefill)?;
         let generated_tokens = token_ids.len();
         let finished = self.scheduler.postprocess(&seq_ids, &token_ids);
+        let finished_ids: Vec<usize> = finished.iter().map(|(seq_id, _)| *seq_id).collect();
+        self.model_runner.clear_sequences(&finished_ids);
 
         Ok((finished, num_tokens, generated_tokens))
     }
