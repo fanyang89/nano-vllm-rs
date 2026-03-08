@@ -173,6 +173,9 @@ impl LLMEngine {
         let mut prefill_time_total = 0.0f64;
         let mut decode_tokens_total = 0u64;
         let mut decode_time_total = 0.0f64;
+        let mut decode_tokens_steady = 0u64;
+        let mut decode_time_steady = 0.0f64;
+        let mut seen_decode_step = false;
         let mut last_pb_update = Instant::now();
 
         while !self.scheduler.is_finished() {
@@ -184,8 +187,15 @@ impl LLMEngine {
                 prefill_tokens_total += num_tokens as u64;
                 prefill_time_total += elapsed;
             } else {
-                decode_tokens_total += (-num_tokens) as u64;
+                let decode_tokens = (-num_tokens) as u64;
+                decode_tokens_total += decode_tokens;
                 decode_time_total += elapsed;
+                if seen_decode_step {
+                    decode_tokens_steady += decode_tokens;
+                    decode_time_steady += elapsed;
+                } else {
+                    seen_decode_step = true;
+                }
             }
 
             for (seq_id, token_ids) in finished {
@@ -209,9 +219,14 @@ impl LLMEngine {
                     } else {
                         0.0
                     };
+                    let decode_steady_tps = if decode_time_steady > 0.0 {
+                        decode_tokens_steady as f64 / decode_time_steady
+                    } else {
+                        decode_tps
+                    };
                     pb.set_message(format!(
-                        "Prefill: {:.0} tok/s  Decode: {:.0} tok/s",
-                        prefill_tps, decode_tps
+                        "Prefill: {:.0} tok/s  Decode(steady): {:.0} tok/s",
+                        prefill_tps, decode_steady_tps
                     ));
                     last_pb_update = Instant::now();
                 }
