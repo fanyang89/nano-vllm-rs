@@ -52,7 +52,7 @@ tasks:
       - chmod +x {{.HIPSIM_DIR}}/hipconfig
       - cargo run --release --features rocm -- run --model {{.MODEL}} --device rocm --prompt "{{.PROMPT}}" --greedy
 
-  bench-py-rocm-fast:
+  bench-rocm-fast:
     desc: Run fast Python-compatible ROCm benchmark
     vars:
       MODEL: ./models/Qwen3-0.6B
@@ -85,14 +85,14 @@ tasks:
       - chmod +x {{.HIPSIM_DIR}}/hipconfig
       - >
         cargo run --release --features rocm --
-        bench-py --model {{.MODEL}} --device rocm
+        bench --model {{.MODEL}} --device rocm
         --num-seqs {{.NUM_SEQS}}
         --max-input-len {{.MAX_INPUT_LEN}}
         --max-output-len {{.MAX_OUTPUT_LEN}}
         --warmup {{.WARMUP}} --iters {{.ITERS}} --seed {{.SEED}}
         {{.QUIET_FLAG}}
 
-  bench-py-rocm:
+  bench-rocm:
     desc: Run normal Python-compatible ROCm benchmark
     vars:
       MODEL: ./models/Qwen3-0.6B
@@ -125,14 +125,14 @@ tasks:
       - chmod +x {{.HIPSIM_DIR}}/hipconfig
       - >
         cargo run --release --features rocm --
-        bench-py --model {{.MODEL}} --device rocm
+        bench --model {{.MODEL}} --device rocm
         --num-seqs {{.NUM_SEQS}}
         --max-input-len {{.MAX_INPUT_LEN}}
         --max-output-len {{.MAX_OUTPUT_LEN}}
         --warmup {{.WARMUP}} --iters {{.ITERS}} --seed {{.SEED}}
         {{.QUIET_FLAG}}
 
-  bench-py-rocm-heavy:
+  bench-rocm-heavy:
     desc: Run heavy Python-compatible ROCm benchmark
     vars:
       MODEL: ./models/Qwen3-0.6B
@@ -165,7 +165,7 @@ tasks:
       - chmod +x {{.HIPSIM_DIR}}/hipconfig
       - >
         cargo run --release --features rocm --
-        bench-py --model {{.MODEL}} --device rocm
+        bench --model {{.MODEL}} --device rocm
         --num-seqs {{.NUM_SEQS}}
         --max-input-len {{.MAX_INPUT_LEN}}
         --max-output-len {{.MAX_OUTPUT_LEN}}
