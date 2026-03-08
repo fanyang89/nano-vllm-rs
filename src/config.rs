@@ -1,4 +1,4 @@
-use anyhow::{Result, ensure};
+use anyhow::{ensure, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
