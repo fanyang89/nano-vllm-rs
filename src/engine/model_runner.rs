@@ -6,7 +6,7 @@ use crate::engine::sequence::Sequence;
 use crate::layers::sampler;
 use crate::model::qwen3::Qwen3ForCausalLM;
 use crate::utils::context::AttentionContext;
-use crate::utils::profiler::Scope;
+use crate::utils::profiler::{self, Scope};
 
 pub struct ModelRunner<B: Backend<IntElem = i32>> {
     model: Qwen3ForCausalLM<B>,
@@ -151,6 +151,7 @@ impl<B: Backend<IntElem = i32>> ModelRunner<B> {
         let cu_seqlens_k_host = cu_seqlens_k.clone();
         let input_ids = self.int_tensor_1d(input_ids);
         let positions = self.int_tensor_1d(positions);
+        let slot_mapping_host = slot_mapping.clone();
         let slot_mapping = self.int_tensor_1d(slot_mapping);
         let cu_seqlens_q = self.int_tensor_1d(cu_seqlens_q);
         let cu_seqlens_k = self.int_tensor_1d(cu_seqlens_k);
@@ -164,6 +165,7 @@ impl<B: Backend<IntElem = i32>> ModelRunner<B> {
             max_seqlen_q,
             max_seqlen_k,
             slot_mapping,
+            slot_mapping_host,
             context_lens: None,
             context_lens_host: None,
             kv_slot_indices: need_block_tables.then_some(kv_slot_indices),
@@ -195,6 +197,7 @@ impl<B: Backend<IntElem = i32>> ModelRunner<B> {
         let n = input_ids.len();
         let input_ids = self.int_tensor_1d(input_ids);
         let positions = self.int_tensor_1d(positions);
+        let slot_mapping_host = slot_mapping.clone();
         let slot_mapping = self.int_tensor_1d(slot_mapping);
         let context_lens_t = self.int_tensor_1d(context_lens.clone());
 
@@ -214,6 +217,7 @@ impl<B: Backend<IntElem = i32>> ModelRunner<B> {
             max_seqlen_q: 1,
             max_seqlen_k: 1,
             slot_mapping,
+            slot_mapping_host,
             context_lens: Some(context_lens_t),
             context_lens_host: Some(context_lens),
             kv_slot_indices: Some(kv_slot_indices),
@@ -245,15 +249,19 @@ impl<B: Backend<IntElem = i32>> ModelRunner<B> {
             &mut self.v_caches,
             &ctx,
         )?;
+        profiler::sync_backend::<B>(&self.device)?;
 
         drop(_scope);
         let _scope = Scope::new("compute_logits");
         let logits = self.model.compute_logits(&hidden_states, &ctx)?;
+        profiler::sync_backend::<B>(&self.device)?;
         let do_sample = seqs.first().is_none_or(|s| s.do_sample);
         debug_assert!(seqs.iter().all(|s| s.do_sample == do_sample));
         drop(_scope);
         let _scope = Scope::new("sample");
         let temperatures = do_sample.then(|| self.prepare_temperatures(seqs));
-        sampler::sample(&logits, temperatures.as_ref(), do_sample)
+        let tokens = sampler::sample(&logits, temperatures.as_ref(), do_sample)?;
+        profiler::sync_backend::<B>(&self.device)?;
+        Ok(tokens)
     }
 }

@@ -3,7 +3,7 @@ use burn::tensor::activation::softmax;
 use burn::tensor::{backend::Backend, DType, Element, IndexingUpdateOp, Int, Tensor};
 
 use crate::utils::context::AttentionContext;
-use crate::utils::profiler::Scope;
+use crate::utils::profiler::{self, Scope};
 
 /// Paged attention with KV cache support.
 pub struct Attention {
@@ -35,7 +35,15 @@ impl Attention {
         ctx: &AttentionContext<B>,
     ) -> Result<Tensor<B, 3>> {
         let _scope = Scope::new("store_kvcache");
-        store_kvcache(k, v, k_cache, v_cache, &ctx.slot_mapping)?;
+        store_kvcache(
+            k,
+            v,
+            k_cache,
+            v_cache,
+            &ctx.slot_mapping,
+            &ctx.slot_mapping_host,
+        )?;
+        profiler::sync_backend::<B>(&k_cache.device())?;
         drop(_scope);
 
         if ctx.is_prefill {
@@ -74,7 +82,13 @@ impl Attention {
 
             let (k_i, v_i) = if has_prefix_cache {
                 let _scope = Scope::new("prefill_gather_kv");
-                self.gather_kv_from_cache(k_cache, v_cache, &kv_slot_indices.expect("checked")[i])?
+                let out = self.gather_kv_from_cache(
+                    k_cache,
+                    v_cache,
+                    &kv_slot_indices.expect("checked")[i],
+                )?;
+                profiler::sync_backend::<B>(&k_cache.device())?;
+                out
             } else {
                 (
                     k.clone()
@@ -85,7 +99,9 @@ impl Attention {
             };
 
             let _scope = Scope::new("prefill_sdpa");
-            outputs.push(self.scaled_dot_product_attention(&q_i, &k_i, &v_i, true)?);
+            let out = self.scaled_dot_product_attention(&q_i, &k_i, &v_i, true)?;
+            profiler::sync_backend::<B>(&out.device())?;
+            outputs.push(out);
             drop(_scope);
             debug_assert_eq!(q_len, outputs.last().unwrap().shape().as_slice()[0]);
         }
@@ -115,6 +131,7 @@ impl Attention {
             debug_assert_eq!(kv_slot_indices[0].shape().as_slice()[0], ctx_len);
             let _scope = Scope::new("decode_gather_kv");
             let (k_i, v_i) = self.gather_kv_from_cache(k_cache, v_cache, &kv_slot_indices[0])?;
+            profiler::sync_backend::<B>(&k_cache.device())?;
             drop(_scope);
             return self.scaled_dot_product_attention(q, &k_i, &v_i, false);
         }
@@ -128,6 +145,7 @@ impl Attention {
             debug_assert_eq!(kv_slot_indices[i].shape().as_slice()[0], ctx_len as usize);
             let _scope = Scope::new("decode_gather_kv");
             let (k_i, v_i) = self.gather_kv_from_cache(k_cache, v_cache, &kv_slot_indices[i])?;
+            profiler::sync_backend::<B>(&k_cache.device())?;
             drop(_scope);
 
             let pad_len = max_ctx_len.saturating_sub(ctx_len as usize);
@@ -200,6 +218,7 @@ impl Attention {
 
         let attn = softmax(attn, 3).cast(native_dtype).unsqueeze_dim::<5>(4);
         let out = (attn * vg).sum_dim(3).squeeze_dim::<4>(3);
+        profiler::sync_backend::<B>(&out.device())?;
         Ok(out.reshape([batch_size, self.num_heads, self.head_dim]))
     }
 
@@ -275,6 +294,7 @@ impl Attention {
 
         let attn = softmax(attn, 2).cast(native_dtype);
         let out = attn.matmul(vh); // [h, q, d]
+        profiler::sync_backend::<B>(&out.device())?;
         Ok(out.swap_dims(0, 1)) // [q, h, d]
     }
 }
@@ -286,6 +306,7 @@ fn store_kvcache<B: Backend>(
     k_cache: &mut Tensor<B, 4>,
     v_cache: &mut Tensor<B, 4>,
     slot_mapping: &Tensor<B, 1, Int>,
+    slot_mapping_host: &[i32],
 ) -> Result<()> {
     let dims = k_cache.shape().as_slice().to_vec();
     ensure!(dims.len() == 4, "k_cache must be rank-4");
@@ -293,6 +314,28 @@ fn store_kvcache<B: Backend>(
     let row_width = dims[2] * dims[3];
 
     let n = key.shape().as_slice()[0];
+
+    if n == 1 && slot_mapping_host.len() == 1 {
+        let slot = slot_mapping_host[0];
+        ensure!(slot >= 0, "decode slot must be non-negative");
+        let slot = slot as usize;
+        ensure!(slot < total_slots, "decode slot out of bounds");
+
+        let key_flat = key.clone().reshape([1, row_width]);
+        let val_flat = value.clone().reshape([1, row_width]);
+        let k_flat = k_cache
+            .clone()
+            .reshape([total_slots, row_width])
+            .slice_assign([slot..slot + 1, 0..row_width], key_flat);
+        let v_flat = v_cache
+            .clone()
+            .reshape([total_slots, row_width])
+            .slice_assign([slot..slot + 1, 0..row_width], val_flat);
+
+        *k_cache = k_flat.reshape([dims[0], dims[1], dims[2], dims[3]]);
+        *v_cache = v_flat.reshape([dims[0], dims[1], dims[2], dims[3]]);
+        return Ok(());
+    }
 
     let mut slots = slot_mapping.clone();
     let valid_mask = slots.clone().greater_equal_elem(0);

@@ -15,6 +15,8 @@ pub struct AttentionContext<B: Backend> {
     pub max_seqlen_k: usize,
     /// Maps each token position to a flat slot in the KV cache, shape [num_tokens], i32.
     pub slot_mapping: Tensor<B, 1, Int>,
+    /// Host-side mirror of `slot_mapping` for fast scalar/range decisions.
+    pub slot_mapping_host: Vec<i32>,
     /// Per-sequence context length for decode, shape [batch], i32.
     pub context_lens: Option<Tensor<B, 1, Int>>,
     /// Host-side mirror of `context_lens` to avoid repeated device synchronization.
