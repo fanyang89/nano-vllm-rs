@@ -1,6 +1,6 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use burn::tensor::activation::silu;
-use burn::tensor::{backend::Backend, Element, Int, Tensor, TensorData};
+use burn::tensor::{backend::Backend, DType, Element, Int, Tensor, TensorData};
 use safetensors::{tensor::TensorView, Dtype, SafeTensors};
 
 use crate::config::ModelConfig;
@@ -31,7 +31,7 @@ pub struct Qwen3ForCausalLM<B: Backend> {
     embed_tokens: Tensor<B, 2>,
     layers: Vec<LayerWeights<B>>,
     norm_w: Tensor<B, 1>,
-    lm_head_weight: Tensor<B, 2>,
+    lm_head_weight_t: Tensor<B, 2>,
     rms_norm_eps: f64,
 }
 
@@ -113,17 +113,17 @@ impl<B: Backend<IntElem = i32>> Qwen3ForCausalLM<B> {
             });
         }
 
-        let lm_head_weight = if config.tie_word_embeddings {
-            embed_tokens.clone()
+        let lm_head_weight_t = if config.tie_word_embeddings {
+            repo.tensor2_transposed::<B>("model.embed_tokens.weight", device)?
         } else {
-            repo.tensor2::<B>("lm_head.weight", device)?
+            repo.tensor2_transposed::<B>("lm_head.weight", device)?
         };
 
         Ok(Self {
             embed_tokens,
             layers,
             norm_w,
-            lm_head_weight,
+            lm_head_weight_t,
             rms_norm_eps: config.rms_norm_eps,
         })
     }
@@ -233,7 +233,7 @@ impl<B: Backend<IntElem = i32>> Qwen3ForCausalLM<B> {
             hidden_states.clone()
         };
 
-        Ok(hidden.matmul(self.lm_head_weight.clone().transpose()))
+        Ok(hidden.matmul(self.lm_head_weight_t.clone()))
     }
 
     pub fn num_layers(&self) -> usize {
@@ -243,6 +243,10 @@ impl<B: Backend<IntElem = i32>> Qwen3ForCausalLM<B> {
 
 fn linear_2d<B: Backend>(x: &Tensor<B, 2>, w_out_in: &Tensor<B, 2>) -> Tensor<B, 2> {
     x.clone().matmul(w_out_in.clone().transpose())
+}
+
+fn native_float_dtype<B: Backend>() -> DType {
+    <B::FloatElem as Element>::dtype()
 }
 
 fn rms_norm_2d<B: Backend>(
@@ -257,15 +261,18 @@ fn rms_norm_2d<B: Backend>(
         weight.shape().as_slice() == [h],
         "rms_norm_2d weight mismatch"
     );
-    let inv = x
+    let dtype = native_float_dtype::<B>();
+    let x_f32 = x.clone().cast(DType::F32);
+    let weight_f32 = weight.clone().cast(DType::F32);
+    let inv = x_f32
         .clone()
         .powf_scalar(2.0)
         .mean_dim(1)
         .add_scalar(eps as f32)
         .sqrt()
         .recip();
-    let w = weight.clone().unsqueeze_dim::<2>(0);
-    Ok(x.clone() * inv * w)
+    let w = weight_f32.unsqueeze_dim::<2>(0);
+    Ok((x_f32 * inv * w).cast(dtype))
 }
 
 fn rms_norm_3d<B: Backend>(
@@ -280,15 +287,18 @@ fn rms_norm_3d<B: Backend>(
         weight.shape().as_slice() == [d],
         "rms_norm_3d weight mismatch"
     );
-    let inv = x
+    let dtype = native_float_dtype::<B>();
+    let x_f32 = x.clone().cast(DType::F32);
+    let weight_f32 = weight.clone().cast(DType::F32);
+    let inv = x_f32
         .clone()
         .powf_scalar(2.0)
         .mean_dim(2)
         .add_scalar(eps as f32)
         .sqrt()
         .recip();
-    let w = weight.clone().unsqueeze_dim::<2>(0).unsqueeze_dim::<3>(0);
-    Ok(x.clone() * inv * w)
+    let w = weight_f32.unsqueeze_dim::<2>(0).unsqueeze_dim::<3>(0);
+    Ok((x_f32 * inv * w).cast(dtype))
 }
 
 fn silu_and_mul_2d<B: Backend>(x: &Tensor<B, 2>) -> Result<Tensor<B, 2>> {
@@ -376,6 +386,15 @@ impl SafetensorRepo {
         tensor_from_view_2d::<B>(view, device)
     }
 
+    fn tensor2_transposed<B: Backend>(
+        &self,
+        key: &str,
+        device: &B::Device,
+    ) -> Result<Tensor<B, 2>> {
+        let view = self.tensor_view(key)?;
+        tensor_from_view_2d_transposed::<B>(view, device)
+    }
+
     fn cat_tensor2<B: Backend>(
         &self,
         keys: &[String],
@@ -419,6 +438,28 @@ fn tensor_from_view_2d<B: Backend>(
     );
     let data = view_to_f32_vec(view)?;
     tensor2_from_f32_data::<B>(data, [shape[0], shape[1]], device)
+}
+
+fn tensor_from_view_2d_transposed<B: Backend>(
+    view: TensorView<'_>,
+    device: &B::Device,
+) -> Result<Tensor<B, 2>> {
+    let shape = view.shape().to_vec();
+    ensure!(
+        shape.len() == 2,
+        "expected rank-2 tensor, got shape {shape:?}"
+    );
+    let rows = shape[0];
+    let cols = shape[1];
+    let data = view_to_f32_vec(view)?;
+    let mut transposed = vec![0.0f32; data.len()];
+    for row in 0..rows {
+        let src = row * cols;
+        for col in 0..cols {
+            transposed[col * rows + row] = data[src + col];
+        }
+    }
+    tensor2_from_f32_data::<B>(transposed, [cols, rows], device)
 }
 
 fn tensor2_from_f32_data<B: Backend>(
