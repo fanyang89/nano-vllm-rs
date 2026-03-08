@@ -2,6 +2,9 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use anyhow::Result;
+use burn::tensor::backend::Backend;
+
 #[derive(Clone, Copy, Default)]
 struct Stat {
     total: Duration,
@@ -11,7 +14,7 @@ struct Stat {
 static ENABLED: OnceLock<bool> = OnceLock::new();
 static STATS: OnceLock<Mutex<BTreeMap<&'static str, Stat>>> = OnceLock::new();
 
-fn enabled() -> bool {
+pub fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("NANO_VLLM_PROFILE").is_ok())
 }
 
@@ -73,4 +76,11 @@ pub fn report() -> Option<String> {
         ));
     }
     Some(out)
+}
+
+pub fn sync_backend<B: Backend>(device: &B::Device) -> Result<()> {
+    if enabled() {
+        B::sync(device).map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    }
+    Ok(())
 }

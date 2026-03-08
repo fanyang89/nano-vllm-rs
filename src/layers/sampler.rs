@@ -3,7 +3,7 @@ use burn::tensor::{backend::Backend, DType, Tensor};
 use rand::Rng;
 
 /// Temperature-based token sampling using the Gumbel-max trick.
-pub fn sample<B: Backend>(
+pub fn sample<B: Backend<IntElem = i32>>(
     logits: &Tensor<B, 2>,
     temperatures: Option<&Tensor<B, 1>>,
     do_sample: bool,
@@ -15,6 +15,11 @@ pub fn sample<B: Backend>(
     let vocab = dims[1];
 
     if !do_sample {
+        if batch == 1 {
+            let token_id = logits.clone().argmax(1).into_scalar();
+            return Ok(vec![token_id as u32]);
+        }
+
         let token_ids = logits.clone().argmax(1).to_data();
         return match token_ids.dtype {
             DType::I32 => Ok(token_ids

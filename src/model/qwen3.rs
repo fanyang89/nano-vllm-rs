@@ -7,7 +7,7 @@ use crate::config::ModelConfig;
 use crate::layers::attention::Attention;
 use crate::layers::rotary_embedding::RotaryEmbedding;
 use crate::utils::context::AttentionContext;
-use crate::utils::profiler::Scope;
+use crate::utils::profiler::{self, Scope};
 
 struct LayerWeights<B: Backend> {
     qkv_proj_w: Tensor<B, 2>,
@@ -161,6 +161,7 @@ impl<B: Backend<IntElem = i32>> Qwen3ForCausalLM<B> {
 
             let _scope = Scope::new("layer_qkv_proj");
             let qkv = linear_2d(&normed, &layer.qkv_proj_w);
+            profiler::sync_backend::<B>(&qkv.device())?;
             drop(_scope);
             let (mut q, mut k, v) = split_qkv(
                 &qkv,
@@ -178,16 +179,19 @@ impl<B: Backend<IntElem = i32>> Qwen3ForCausalLM<B> {
 
             let _scope = Scope::new("layer_rope");
             let (q, k) = layer.rotary.forward(positions, &q, &k)?;
+            profiler::sync_backend::<B>(&q.device())?;
             drop(_scope);
             let _scope = Scope::new("layer_attention");
             let o = layer
                 .attn
                 .forward(&q, &k, &v, &mut k_caches[i], &mut v_caches[i], ctx)?;
+            profiler::sync_backend::<B>(&o.device())?;
             drop(_scope);
             let n = o.shape().as_slice()[0];
             let o = o.reshape([n, layer.num_heads * layer.head_dim]);
             let _scope = Scope::new("layer_o_proj");
             let attn_out = linear_2d(&o, &layer.o_proj_w);
+            profiler::sync_backend::<B>(&attn_out.device())?;
             drop(_scope);
 
             let x = attn_out + new_residual.clone();
@@ -196,6 +200,7 @@ impl<B: Backend<IntElem = i32>> Qwen3ForCausalLM<B> {
             let gate_up = linear_2d(&normed, &layer.gate_up_w);
             let mlp_act = silu_and_mul_2d(&gate_up)?;
             let mlp_out = linear_2d(&mlp_act, &layer.down_proj_w);
+            profiler::sync_backend::<B>(&mlp_out.device())?;
             drop(_scope);
 
             hidden_states = mlp_out;
