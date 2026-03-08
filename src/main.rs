@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use tablestream::{Column, Stream};
@@ -100,9 +100,17 @@ struct BenchArgs {
     #[arg(long, default_value_t = 1)]
     repeat_prompt: usize,
 
+    /// Sweep repeat counts to measure throughput scaling, e.g. 1,2,4,8,16
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    throughput_repeats: Vec<usize>,
+
     /// Disable random sampling and use greedy decoding (argmax)
     #[arg(long, default_value_t = false)]
     greedy: bool,
+
+    /// Ignore EOS and always run to max_tokens for throughput measurements
+    #[arg(long, default_value_t = false)]
+    ignore_eos: bool,
 
     /// Warmup iterations before timed runs
     #[arg(long, default_value_t = 1)]
@@ -158,6 +166,13 @@ struct IterMetrics {
     ttft_ms: f64,
 }
 
+#[derive(Debug, Clone)]
+struct BenchScenario {
+    repeat: usize,
+    prompt_count: usize,
+    metrics: Vec<IterMetrics>,
+}
+
 fn run_inference(args: RunArgs) -> Result<()> {
     #[cfg(debug_assertions)]
     eprintln!(
@@ -204,11 +219,29 @@ fn run_benchmark(args: BenchArgs) -> Result<()> {
     );
 
     let base_prompts: Vec<String> = default_prompts(args.prompt);
-    let repeat = args.repeat_prompt.max(1);
-    let expanded_prompts: Vec<String> = expand_prompts(&base_prompts, repeat);
-    let prompts: Vec<&str> = expanded_prompts.iter().map(|s| s.as_str()).collect();
-    let sampling_params =
-        SamplingParams::new(args.temperature, args.max_tokens, false, !args.greedy);
+    let mut repeats = if args.throughput_repeats.is_empty() {
+        vec![args.repeat_prompt.max(1)]
+    } else {
+        let mut repeats: Vec<usize> = args
+            .throughput_repeats
+            .iter()
+            .copied()
+            .map(|v| v.max(1))
+            .collect();
+        repeats.sort_unstable();
+        repeats.dedup();
+        repeats
+    };
+    if repeats.is_empty() {
+        repeats.push(1);
+    }
+    let is_sweep = repeats.len() > 1;
+    let sampling_params = SamplingParams::new(
+        args.temperature,
+        args.max_tokens,
+        args.ignore_eos,
+        !args.greedy,
+    );
 
     tracing_subscriber::fmt::init();
 
@@ -220,32 +253,54 @@ fn run_benchmark(args: BenchArgs) -> Result<()> {
     let mut engine = LLMEngine::new(&args.model, runtime_device)?;
 
     println!(
-        "Benchmark config: prompts={} (base={}, repeat={}), warmup={}, iters={}, max_tokens={}, greedy={}",
-        prompts.len(),
+        "Benchmark config: base_prompts={}, repeats={:?}, warmup={}, iters={}, max_tokens={}, greedy={}, ignore_eos={}",
         base_prompts.len(),
-        repeat,
+        repeats,
         args.warmup,
         args.iters,
         args.max_tokens,
-        args.greedy
+        args.greedy,
+        args.ignore_eos
     );
 
-    for i in 0..args.warmup {
-        let _ = engine.generate_with_stats(&prompts, &sampling_params, false)?;
-        println!("Warmup {}/{} done", i + 1, args.warmup);
+    let mut scenarios = Vec::with_capacity(repeats.len());
+    for &repeat in &repeats {
+        let expanded_prompts: Vec<String> = expand_prompts(&base_prompts, repeat);
+        let prompts: Vec<&str> = expanded_prompts.iter().map(|s| s.as_str()).collect();
+
+        println!(
+            "\nScenario: prompts={} (base={}, repeat={})",
+            prompts.len(),
+            base_prompts.len(),
+            repeat
+        );
+
+        for i in 0..args.warmup {
+            let _ = engine.generate_with_stats(&prompts, &sampling_params, false)?;
+            println!("Warmup {}/{} done", i + 1, args.warmup);
+        }
+
+        let mut all = Vec::with_capacity(args.iters);
+        for _ in 0..args.iters {
+            let started = Instant::now();
+            let (outputs, stats) = engine.generate_with_stats(&prompts, &sampling_params, false)?;
+            let wall_time_s = started.elapsed().as_secs_f64();
+            let output_tokens: usize = outputs.iter().map(|o| o.token_ids.len()).sum();
+            let metrics = to_metrics(&stats, output_tokens, wall_time_s);
+            all.push(metrics);
+        }
+
+        print_benchmark_tables(&all);
+        scenarios.push(BenchScenario {
+            repeat,
+            prompt_count: prompts.len(),
+            metrics: all,
+        });
     }
 
-    let mut all = Vec::with_capacity(args.iters);
-    for _ in 0..args.iters {
-        let started = Instant::now();
-        let (outputs, stats) = engine.generate_with_stats(&prompts, &sampling_params, false)?;
-        let wall_time_s = started.elapsed().as_secs_f64();
-        let output_tokens: usize = outputs.iter().map(|o| o.token_ids.len()).sum();
-        let metrics = to_metrics(&stats, output_tokens, wall_time_s);
-        all.push(metrics);
+    if is_sweep {
+        print_throughput_sweep_table(&scenarios);
     }
-
-    print_benchmark_tables(&all);
     Ok(())
 }
 
@@ -311,15 +366,15 @@ struct BenchRow {
 
 #[derive(Clone)]
 struct SummaryRow {
-    mean_total_s: String,
-    mean_output_tokens: String,
-    mean_e2e_tps: String,
-    mean_prefill_tps: String,
-    mean_decode_tps: String,
-    mean_decode_steady_tps: String,
-    mean_ttft_ms: String,
-    min_decode_steady_tps: String,
-    max_decode_steady_tps: String,
+    metric: &'static str,
+    value: String,
+}
+
+#[derive(Clone)]
+struct ThroughputSweepRow {
+    scenario: String,
+    metric: &'static str,
+    value: String,
 }
 
 fn print_benchmark_tables(all: &[IterMetrics]) {
@@ -412,54 +467,155 @@ fn print_benchmark_tables(all: &[IterMetrics]) {
         .map(|m| m.decode_steady_tps)
         .fold(0.0_f64, f64::max);
 
-    let row = SummaryRow {
-        mean_total_s: format!("{:.3}", mean_total_s),
-        mean_output_tokens: format!("{:.1}", mean_output_tokens),
-        mean_e2e_tps: format!("{:.2}", mean_e2e_tps),
-        mean_prefill_tps: format!("{:.2}", mean_prefill_tps),
-        mean_decode_tps: format!("{:.2}", mean_decode_tps),
-        mean_decode_steady_tps: format!("{:.2}", mean_decode_steady_tps),
-        mean_ttft_ms: format!("{:.1}", mean_ttft_ms),
-        min_decode_steady_tps: format!("{:.2}", min_decode_steady_tps),
-        max_decode_steady_tps: format!("{:.2}", max_decode_steady_tps),
-    };
+    let rows = vec![
+        SummaryRow {
+            metric: "mean_total_s",
+            value: format!("{:.3}", mean_total_s),
+        },
+        SummaryRow {
+            metric: "mean_output_tokens",
+            value: format!("{:.1}", mean_output_tokens),
+        },
+        SummaryRow {
+            metric: "mean_e2e_tps",
+            value: format!("{:.2}", mean_e2e_tps),
+        },
+        SummaryRow {
+            metric: "mean_prefill_tps",
+            value: format!("{:.2}", mean_prefill_tps),
+        },
+        SummaryRow {
+            metric: "mean_decode_tps",
+            value: format!("{:.2}", mean_decode_tps),
+        },
+        SummaryRow {
+            metric: "mean_decode_steady_tps",
+            value: format!("{:.2}", mean_decode_steady_tps),
+        },
+        SummaryRow {
+            metric: "mean_ttft_ms",
+            value: format!("{:.1}", mean_ttft_ms),
+        },
+        SummaryRow {
+            metric: "min_decode_steady_tps",
+            value: format!("{:.2}", min_decode_steady_tps),
+        },
+        SummaryRow {
+            metric: "max_decode_steady_tps",
+            value: format!("{:.2}", max_decode_steady_tps),
+        },
+    ];
 
     let mut summary = Stream::new(
         std::io::stdout(),
         vec![
-            Column::new(|f, r: &SummaryRow| write!(f, "{}", r.mean_total_s))
-                .header("mean_total_s")
-                .right(),
-            Column::new(|f, r: &SummaryRow| write!(f, "{}", r.mean_output_tokens))
-                .header("mean_output_tokens")
-                .right(),
-            Column::new(|f, r: &SummaryRow| write!(f, "{}", r.mean_e2e_tps))
-                .header("mean_e2e_tps")
-                .right(),
-            Column::new(|f, r: &SummaryRow| write!(f, "{}", r.mean_prefill_tps))
-                .header("mean_prefill_tps")
-                .right(),
-            Column::new(|f, r: &SummaryRow| write!(f, "{}", r.mean_decode_tps))
-                .header("mean_decode_tps")
-                .right(),
-            Column::new(|f, r: &SummaryRow| write!(f, "{}", r.mean_decode_steady_tps))
-                .header("mean_decode_steady_tps")
-                .right(),
-            Column::new(|f, r: &SummaryRow| write!(f, "{}", r.mean_ttft_ms))
-                .header("mean_ttft_ms")
-                .right(),
-            Column::new(|f, r: &SummaryRow| write!(f, "{}", r.min_decode_steady_tps))
-                .header("min_decode_steady_tps")
-                .right(),
-            Column::new(|f, r: &SummaryRow| write!(f, "{}", r.max_decode_steady_tps))
-                .header("max_decode_steady_tps")
+            Column::new(|f, r: &SummaryRow| write!(f, "{}", r.metric)).header("metric"),
+            Column::new(|f, r: &SummaryRow| write!(f, "{}", r.value))
+                .header("value")
                 .right(),
         ],
     )
     .borders(true)
     .title("Benchmark Summary");
-    let _ = summary.row(row);
+    for row in rows {
+        let _ = summary.row(row);
+    }
     let _ = summary.finish();
+}
+
+fn print_throughput_sweep_table(scenarios: &[BenchScenario]) {
+    if scenarios.is_empty() {
+        return;
+    }
+
+    let rows: Vec<ThroughputSweepRow> = scenarios
+        .iter()
+        .flat_map(|scenario| {
+            let n = scenario.metrics.len() as f64;
+            let mean_output_tokens = scenario
+                .metrics
+                .iter()
+                .map(|m| m.output_tokens as f64)
+                .sum::<f64>()
+                / n;
+            let mean_e2e_tps_total = scenario
+                .metrics
+                .iter()
+                .map(|m| {
+                    if m.total_time_s > 0.0 {
+                        m.output_tokens as f64 / m.total_time_s
+                    } else {
+                        0.0
+                    }
+                })
+                .sum::<f64>()
+                / n;
+            let mean_decode_steady_tps_total = scenario
+                .metrics
+                .iter()
+                .map(|m| m.decode_steady_tps)
+                .sum::<f64>()
+                / n;
+            let mean_ttft_ms = scenario.metrics.iter().map(|m| m.ttft_ms).sum::<f64>() / n;
+            let prompt_count = scenario.prompt_count.max(1);
+            let scenario_label = format!("repeat={} prompts={}", scenario.repeat, prompt_count);
+
+            vec![
+                ThroughputSweepRow {
+                    scenario: scenario_label.clone(),
+                    metric: "mean_output_tokens",
+                    value: format!("{:.1}", mean_output_tokens),
+                },
+                ThroughputSweepRow {
+                    scenario: scenario_label.clone(),
+                    metric: "tokens_per_req",
+                    value: format!("{:.1}", mean_output_tokens / prompt_count as f64),
+                },
+                ThroughputSweepRow {
+                    scenario: scenario_label.clone(),
+                    metric: "e2e_tps_total",
+                    value: format!("{:.2}", mean_e2e_tps_total),
+                },
+                ThroughputSweepRow {
+                    scenario: scenario_label.clone(),
+                    metric: "e2e_tps_per_req",
+                    value: format!("{:.2}", mean_e2e_tps_total / prompt_count as f64),
+                },
+                ThroughputSweepRow {
+                    scenario: scenario_label.clone(),
+                    metric: "decode_steady_tps_total",
+                    value: format!("{:.2}", mean_decode_steady_tps_total),
+                },
+                ThroughputSweepRow {
+                    scenario: scenario_label.clone(),
+                    metric: "decode_steady_tps_per_req",
+                    value: format!("{:.2}", mean_decode_steady_tps_total / prompt_count as f64),
+                },
+                ThroughputSweepRow {
+                    scenario: scenario_label,
+                    metric: "mean_ttft_ms",
+                    value: format!("{:.1}", mean_ttft_ms),
+                },
+            ]
+        })
+        .collect();
+
+    let mut table = Stream::new(
+        std::io::stdout(),
+        vec![
+            Column::new(|f, r: &ThroughputSweepRow| write!(f, "{}", r.scenario)).header("scenario"),
+            Column::new(|f, r: &ThroughputSweepRow| write!(f, "{}", r.metric)).header("metric"),
+            Column::new(|f, r: &ThroughputSweepRow| write!(f, "{}", r.value))
+                .header("value")
+                .right(),
+        ],
+    )
+    .borders(true)
+    .title("Throughput Sweep");
+    for row in rows {
+        let _ = table.row(row);
+    }
+    let _ = table.finish();
 }
 
 fn run_convert_model(args: ConvertModelArgs) -> Result<()> {
