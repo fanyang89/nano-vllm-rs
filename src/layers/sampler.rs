@@ -1,12 +1,11 @@
 use anyhow::{ensure, Context, Result};
-use burn::tensor::{DType, Tensor};
-use burn_dispatch::Dispatch;
+use burn::tensor::{backend::Backend, DType, Tensor};
 use rand::Rng;
 
 /// Temperature-based token sampling using the Gumbel-max trick.
-pub fn sample(
-    logits: &Tensor<Dispatch, 2>,
-    temperatures: Option<&Tensor<Dispatch, 1>>,
+pub fn sample<B: Backend>(
+    logits: &Tensor<B, 2>,
+    temperatures: Option<&Tensor<B, 1>>,
     do_sample: bool,
 ) -> Result<Vec<u32>> {
     let shape = logits.shape();
@@ -78,17 +77,17 @@ pub fn sample(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::CpuBackend;
     use burn::tensor::TensorData;
-    use burn_dispatch::{Dispatch, DispatchDevice};
 
     #[test]
     fn test_greedy_mode() {
-        let device = DispatchDevice::default();
-        let logits = Tensor::<Dispatch, 2>::from_data(
+        let device = Default::default();
+        let logits = Tensor::<CpuBackend, 2>::from_data(
             TensorData::new(vec![0.0f32, 1.0, 10.0, 2.0], [1, 4]),
             &device,
         );
-        let temps = Tensor::<Dispatch, 1>::from_data(TensorData::new(vec![1.0f32], [1]), &device);
+        let temps = Tensor::<CpuBackend, 1>::from_data(TensorData::new(vec![1.0f32], [1]), &device);
         let tokens = sample(&logits, Some(&temps), false).unwrap();
         assert_eq!(tokens, vec![2]);
     }

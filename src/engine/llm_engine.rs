@@ -2,10 +2,14 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use anyhow::Result;
-use burn_dispatch::DispatchDevice;
+use burn::tensor::backend::Backend;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Deserialize;
 
+#[cfg(feature = "cpu")]
+use crate::backend::CpuBackend;
+#[cfg(feature = "rocm")]
+use crate::backend::RocmBackend;
 use crate::config::{EngineConfig, ModelConfig};
 use crate::engine::model_runner::ModelRunner;
 use crate::engine::scheduler::Scheduler;
@@ -36,10 +40,17 @@ pub enum RuntimeDevice {
     Rocm,
 }
 
-pub struct LLMEngine {
+pub enum LLMEngine {
+    #[cfg(feature = "cpu")]
+    Cpu(LLMEngineImpl<CpuBackend>),
+    #[cfg(feature = "rocm")]
+    Rocm(LLMEngineImpl<RocmBackend>),
+}
+
+pub struct LLMEngineImpl<B: Backend<IntElem = i32>> {
     tokenizer: tokenizers::Tokenizer,
     scheduler: Scheduler,
-    model_runner: ModelRunner,
+    model_runner: ModelRunner<B>,
     block_size: usize,
     use_qwen3_chat: bool,
 }
@@ -59,19 +70,78 @@ struct GenerationConfig {
 
 impl LLMEngine {
     pub fn new(model_path: &str, runtime_device: RuntimeDevice) -> Result<Self> {
+        match runtime_device {
+            #[cfg(feature = "cpu")]
+            RuntimeDevice::Cpu => Ok(Self::Cpu(LLMEngineImpl::<CpuBackend>::new(
+                model_path,
+                burn_ndarray::NdArrayDevice::Cpu,
+            )?)),
+            #[cfg(not(feature = "cpu"))]
+            RuntimeDevice::Cpu => {
+                anyhow::bail!(
+                    "CPU requested but this binary was built without `cpu` feature support"
+                )
+            }
+
+            #[cfg(feature = "rocm")]
+            RuntimeDevice::Rocm => Ok(Self::Rocm(LLMEngineImpl::<RocmBackend>::new(
+                model_path,
+                burn_rocm::RocmDevice::default(),
+            )?)),
+            #[cfg(not(feature = "rocm"))]
+            RuntimeDevice::Rocm => {
+                anyhow::bail!(
+                    "ROCm requested but this binary was built without `rocm` feature support"
+                )
+            }
+        }
+    }
+
+    pub fn add_request(&mut self, prompt: &str, sampling_params: &SamplingParams) -> Result<()> {
+        match self {
+            #[cfg(feature = "cpu")]
+            Self::Cpu(engine) => engine.add_request(prompt, sampling_params),
+            #[cfg(feature = "rocm")]
+            Self::Rocm(engine) => engine.add_request(prompt, sampling_params),
+        }
+    }
+
+    pub fn generate(
+        &mut self,
+        prompts: &[&str],
+        sampling_params: &SamplingParams,
+        use_tqdm: bool,
+    ) -> Result<Vec<GenerationOutput>> {
+        let (outputs, _stats) = self.generate_with_stats(prompts, sampling_params, use_tqdm)?;
+        Ok(outputs)
+    }
+
+    pub fn generate_with_stats(
+        &mut self,
+        prompts: &[&str],
+        sampling_params: &SamplingParams,
+        use_tqdm: bool,
+    ) -> Result<(Vec<GenerationOutput>, GenerationStats)> {
+        match self {
+            #[cfg(feature = "cpu")]
+            Self::Cpu(engine) => engine.generate_with_stats(prompts, sampling_params, use_tqdm),
+            #[cfg(feature = "rocm")]
+            Self::Rocm(engine) => engine.generate_with_stats(prompts, sampling_params, use_tqdm),
+        }
+    }
+}
+
+impl<B: Backend<IntElem = i32>> LLMEngineImpl<B> {
+    fn new(model_path: &str, device: B::Device) -> Result<Self> {
         let model_path = std::path::PathBuf::from(model_path);
         let model_config = ModelConfig::from_dir(&model_path)?;
         let mut engine_config = EngineConfig::new(model_path.clone(), &model_config)?;
+        let model_runner = ModelRunner::<B>::new(&mut engine_config, &model_config, device)?;
 
-        let device = create_device(runtime_device)?;
-        let model_runner = ModelRunner::new(&mut engine_config, &model_config, device)?;
-
-        // Load tokenizer
         let tokenizer_path = model_path.join("tokenizer.json");
         let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?;
 
-        // Set EOS token, preferring generation_config.json when available.
         let generation_config_path = model_path.join("generation_config.json");
         if let Ok(content) = std::fs::read_to_string(&generation_config_path) {
             if let Ok(gen_cfg) = serde_json::from_str::<GenerationConfig>(&content) {
@@ -87,7 +157,6 @@ impl LLMEngine {
             }
         }
 
-        // Fallback EOS selection from model config / tokenizer vocab.
         if engine_config.eos_token_id == 0 {
             if let Some(id) = model_config.eos_token_id {
                 engine_config.eos_token_id = id;
@@ -104,7 +173,6 @@ impl LLMEngine {
         }
 
         let use_qwen3_chat = model_config.model_type.as_deref() == Some("qwen3");
-
         let block_size = engine_config.kvcache_block_size;
         let scheduler = Scheduler::new(&engine_config);
 
@@ -117,7 +185,7 @@ impl LLMEngine {
         })
     }
 
-    pub fn add_request(&mut self, prompt: &str, sampling_params: &SamplingParams) -> Result<()> {
+    fn add_request(&mut self, prompt: &str, sampling_params: &SamplingParams) -> Result<()> {
         let prompt = if self.use_qwen3_chat {
             format!(
                 "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
@@ -137,8 +205,6 @@ impl LLMEngine {
 
     fn step(&mut self) -> Result<(Vec<(usize, Vec<u32>)>, i64, usize)> {
         let (seq_ids, is_prefill) = self.scheduler.schedule();
-
-        // Collect sequence references for model_runner
         let seq_refs: Vec<&Sequence> = seq_ids
             .iter()
             .map(|id| self.scheduler.sequences.get(id).unwrap())
@@ -157,17 +223,7 @@ impl LLMEngine {
         Ok((finished, num_tokens, generated_tokens))
     }
 
-    pub fn generate(
-        &mut self,
-        prompts: &[&str],
-        sampling_params: &SamplingParams,
-        use_tqdm: bool,
-    ) -> Result<Vec<GenerationOutput>> {
-        let (outputs, _stats) = self.generate_with_stats(prompts, sampling_params, use_tqdm)?;
-        Ok(outputs)
-    }
-
-    pub fn generate_with_stats(
+    fn generate_with_stats(
         &mut self,
         prompts: &[&str],
         sampling_params: &SamplingParams,
@@ -266,7 +322,6 @@ impl LLMEngine {
         }
         stats.total_time_s = total_start.elapsed().as_secs_f64();
 
-        // Sort by seq_id and decode
         let mut sorted: Vec<_> = outputs.into_iter().collect();
         sorted.sort_by_key(|(id, _)| *id);
 
@@ -284,31 +339,4 @@ impl LLMEngine {
 
         Ok((results, stats))
     }
-}
-
-fn create_device(runtime_device: RuntimeDevice) -> Result<DispatchDevice> {
-    match runtime_device {
-        RuntimeDevice::Cpu => create_cpu_device(),
-        RuntimeDevice::Rocm => create_rocm_device(),
-    }
-}
-
-#[cfg(feature = "cpu")]
-fn create_cpu_device() -> Result<DispatchDevice> {
-    Ok(DispatchDevice::NdArray(burn_ndarray::NdArrayDevice::Cpu))
-}
-
-#[cfg(not(feature = "cpu"))]
-fn create_cpu_device() -> Result<DispatchDevice> {
-    anyhow::bail!("CPU requested but this binary was built without `cpu` feature support")
-}
-
-#[cfg(feature = "rocm")]
-fn create_rocm_device() -> Result<DispatchDevice> {
-    Ok(DispatchDevice::Rocm(burn_rocm::RocmDevice::default()))
-}
-
-#[cfg(not(feature = "rocm"))]
-fn create_rocm_device() -> Result<DispatchDevice> {
-    anyhow::bail!("ROCm requested but this binary was built without `rocm` feature support")
 }

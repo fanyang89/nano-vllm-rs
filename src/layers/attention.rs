@@ -1,7 +1,6 @@
 use anyhow::{ensure, Result};
 use burn::tensor::activation::softmax;
-use burn::tensor::{IndexingUpdateOp, Int, Tensor};
-use burn_dispatch::Dispatch;
+use burn::tensor::{backend::Backend, IndexingUpdateOp, Int, Tensor};
 
 use crate::utils::context::AttentionContext;
 use crate::utils::profiler::Scope;
@@ -23,16 +22,18 @@ impl Attention {
             scale: (head_dim as f32).powf(-0.5),
         }
     }
+}
 
-    pub fn forward(
+impl Attention {
+    pub fn forward<B: Backend>(
         &self,
-        q: &Tensor<Dispatch, 3>,
-        k: &Tensor<Dispatch, 3>,
-        v: &Tensor<Dispatch, 3>,
-        k_cache: &mut Tensor<Dispatch, 4>,
-        v_cache: &mut Tensor<Dispatch, 4>,
-        ctx: &AttentionContext,
-    ) -> Result<Tensor<Dispatch, 3>> {
+        q: &Tensor<B, 3>,
+        k: &Tensor<B, 3>,
+        v: &Tensor<B, 3>,
+        k_cache: &mut Tensor<B, 4>,
+        v_cache: &mut Tensor<B, 4>,
+        ctx: &AttentionContext<B>,
+    ) -> Result<Tensor<B, 3>> {
         let _scope = Scope::new("store_kvcache");
         store_kvcache(k, v, k_cache, v_cache, &ctx.slot_mapping)?;
         drop(_scope);
@@ -44,15 +45,15 @@ impl Attention {
         }
     }
 
-    fn prefill_attention(
+    fn prefill_attention<B: Backend>(
         &self,
-        q: &Tensor<Dispatch, 3>,
-        k: &Tensor<Dispatch, 3>,
-        v: &Tensor<Dispatch, 3>,
-        k_cache: &Tensor<Dispatch, 4>,
-        v_cache: &Tensor<Dispatch, 4>,
-        ctx: &AttentionContext,
-    ) -> Result<Tensor<Dispatch, 3>> {
+        q: &Tensor<B, 3>,
+        k: &Tensor<B, 3>,
+        v: &Tensor<B, 3>,
+        k_cache: &Tensor<B, 4>,
+        v_cache: &Tensor<B, 4>,
+        ctx: &AttentionContext<B>,
+    ) -> Result<Tensor<B, 3>> {
         let cu_seqlens_q = &ctx.cu_seqlens_q_host;
         let cu_seqlens_k = &ctx.cu_seqlens_k_host;
         let batch_size = cu_seqlens_q.len().saturating_sub(1);
@@ -89,16 +90,16 @@ impl Attention {
             debug_assert_eq!(q_len, outputs.last().unwrap().shape().as_slice()[0]);
         }
 
-        Ok(Tensor::<Dispatch, 3>::cat(outputs, 0))
+        Ok(Tensor::<B, 3>::cat(outputs, 0))
     }
 
-    fn decode_attention(
+    fn decode_attention<B: Backend>(
         &self,
-        q: &Tensor<Dispatch, 3>,
-        k_cache: &Tensor<Dispatch, 4>,
-        v_cache: &Tensor<Dispatch, 4>,
-        ctx: &AttentionContext,
-    ) -> Result<Tensor<Dispatch, 3>> {
+        q: &Tensor<B, 3>,
+        k_cache: &Tensor<B, 4>,
+        v_cache: &Tensor<B, 4>,
+        ctx: &AttentionContext<B>,
+    ) -> Result<Tensor<B, 3>> {
         let context_lens = ctx
             .context_lens_host
             .as_ref()
@@ -122,13 +123,10 @@ impl Attention {
 
             let pad_len = max_ctx_len.saturating_sub(ctx_len as usize);
             let k_i = if pad_len > 0 {
-                Tensor::<Dispatch, 3>::cat(
+                Tensor::<B, 3>::cat(
                     vec![
                         k_i,
-                        Tensor::<Dispatch, 3>::zeros(
-                            [pad_len, self.num_kv_heads, self.head_dim],
-                            &device,
-                        ),
+                        Tensor::<B, 3>::zeros([pad_len, self.num_kv_heads, self.head_dim], &device),
                     ],
                     0,
                 )
@@ -136,13 +134,10 @@ impl Attention {
                 k_i
             };
             let v_i = if pad_len > 0 {
-                Tensor::<Dispatch, 3>::cat(
+                Tensor::<B, 3>::cat(
                     vec![
                         v_i,
-                        Tensor::<Dispatch, 3>::zeros(
-                            [pad_len, self.num_kv_heads, self.head_dim],
-                            &device,
-                        ),
+                        Tensor::<B, 3>::zeros([pad_len, self.num_kv_heads, self.head_dim], &device),
                     ],
                     0,
                 )
@@ -154,18 +149,18 @@ impl Attention {
             v_batch.push(v_i.unsqueeze_dim::<4>(0));
         }
 
-        let k = Tensor::<Dispatch, 4>::cat(k_batch, 0);
-        let v = Tensor::<Dispatch, 4>::cat(v_batch, 0);
+        let k = Tensor::<B, 4>::cat(k_batch, 0);
+        let v = Tensor::<B, 4>::cat(v_batch, 0);
         self.batched_decode_attention(q, &k, &v, context_lens)
     }
 
-    fn batched_decode_attention(
+    fn batched_decode_attention<B: Backend>(
         &self,
-        q: &Tensor<Dispatch, 3>,
-        k: &Tensor<Dispatch, 4>,
-        v: &Tensor<Dispatch, 4>,
+        q: &Tensor<B, 3>,
+        k: &Tensor<B, 4>,
+        v: &Tensor<B, 4>,
         context_lens: &[i32],
-    ) -> Result<Tensor<Dispatch, 3>> {
+    ) -> Result<Tensor<B, 3>> {
         let _scope = Scope::new("decode_sdpa");
         let batch_size = q.shape().as_slice()[0];
         let kv_len = k.shape().as_slice()[1];
@@ -186,7 +181,7 @@ impl Attention {
             let len = len as usize;
             mask.extend((0..kv_len).map(|idx| if idx < len { 0.0 } else { f32::NEG_INFINITY }));
         }
-        let mask = Tensor::<Dispatch, 4>::from_data(
+        let mask = Tensor::<B, 4>::from_data(
             burn::tensor::TensorData::new(mask, [batch_size, 1, 1, kv_len]),
             &attn.device(),
         );
@@ -197,12 +192,12 @@ impl Attention {
         Ok(out.reshape([batch_size, self.num_heads, self.head_dim]))
     }
 
-    fn gather_kv_from_cache(
+    fn gather_kv_from_cache<B: Backend>(
         &self,
-        k_cache: &Tensor<Dispatch, 4>,
-        v_cache: &Tensor<Dispatch, 4>,
-        slot_indices: &Tensor<Dispatch, 1, Int>,
-    ) -> Result<(Tensor<Dispatch, 3>, Tensor<Dispatch, 3>)> {
+        k_cache: &Tensor<B, 4>,
+        v_cache: &Tensor<B, 4>,
+        slot_indices: &Tensor<B, 1, Int>,
+    ) -> Result<(Tensor<B, 3>, Tensor<B, 3>)> {
         let cache_dims = k_cache.shape().as_slice().to_vec();
         let total_slots = cache_dims[0] * cache_dims[1];
         let seq_len = slot_indices.shape().as_slice()[0];
@@ -226,13 +221,13 @@ impl Attention {
         Ok((k, v))
     }
 
-    fn scaled_dot_product_attention(
+    fn scaled_dot_product_attention<B: Backend>(
         &self,
-        q: &Tensor<Dispatch, 3>,
-        k: &Tensor<Dispatch, 3>,
-        v: &Tensor<Dispatch, 3>,
+        q: &Tensor<B, 3>,
+        k: &Tensor<B, 3>,
+        v: &Tensor<B, 3>,
         causal: bool,
-    ) -> Result<Tensor<Dispatch, 3>> {
+    ) -> Result<Tensor<B, 3>> {
         let q_len = q.shape().as_slice()[0];
         let kv_len = k.shape().as_slice()[0];
         let groups = self.num_heads / self.num_kv_heads;
@@ -272,12 +267,12 @@ impl Attention {
 }
 
 /// Store K/V into paged cache using tensor scatter ops.
-fn store_kvcache(
-    key: &Tensor<Dispatch, 3>,
-    value: &Tensor<Dispatch, 3>,
-    k_cache: &mut Tensor<Dispatch, 4>,
-    v_cache: &mut Tensor<Dispatch, 4>,
-    slot_mapping: &Tensor<Dispatch, 1, Int>,
+fn store_kvcache<B: Backend>(
+    key: &Tensor<B, 3>,
+    value: &Tensor<B, 3>,
+    k_cache: &mut Tensor<B, 4>,
+    v_cache: &mut Tensor<B, 4>,
+    slot_mapping: &Tensor<B, 1, Int>,
 ) -> Result<()> {
     let dims = k_cache.shape().as_slice().to_vec();
     ensure!(dims.len() == 4, "k_cache must be rank-4");
@@ -310,21 +305,17 @@ fn store_kvcache(
     Ok(())
 }
 
-fn create_causal_mask(
-    q_len: usize,
-    kv_len: usize,
-    device: &burn_dispatch::DispatchDevice,
-) -> Tensor<Dispatch, 3> {
+fn create_causal_mask<B: Backend>(q_len: usize, kv_len: usize, device: &B::Device) -> Tensor<B, 3> {
     let offset = (kv_len as i64 - q_len as i64) as i32;
-    let q_idx = Tensor::<Dispatch, 1, Int>::arange(0..q_len as i64, device)
+    let q_idx = Tensor::<B, 1, Int>::arange(0..q_len as i64, device)
         .reshape([q_len, 1])
         .repeat(&[1, kv_len]);
-    let k_idx = Tensor::<Dispatch, 1, Int>::arange(0..kv_len as i64, device)
+    let k_idx = Tensor::<B, 1, Int>::arange(0..kv_len as i64, device)
         .reshape([1, kv_len])
         .repeat(&[q_len, 1]);
 
     let allowed = k_idx.lower_equal(q_idx.add_scalar(offset));
-    let mask = Tensor::<Dispatch, 2>::zeros([q_len, kv_len], device)
+    let mask = Tensor::<B, 2>::zeros([q_len, kv_len], device)
         .mask_fill(allowed.bool_not(), f32::NEG_INFINITY);
     mask.unsqueeze_dim::<3>(0)
 }
