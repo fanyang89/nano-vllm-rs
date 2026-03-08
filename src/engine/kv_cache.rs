@@ -120,11 +120,17 @@ impl<B: Backend<IntElem = i32>> KvCache<B> {
         let maybe_prev = self.tails.remove(&seq_id);
         let next = if let Some(prev) = maybe_prev {
             if prev.block_id == block_id && prev.len + 1 == block_len {
+                let pos = prev.len;
                 TailState {
                     block_id,
                     len: block_len,
-                    k: Tensor::<B, 3>::cat(vec![prev.k, key], 0),
-                    v: Tensor::<B, 3>::cat(vec![prev.v, value], 0),
+                    k: prev
+                        .k
+                        .slice_assign([pos..pos + 1, 0..self.num_kv_heads, 0..self.head_dim], key),
+                    v: prev.v.slice_assign(
+                        [pos..pos + 1, 0..self.num_kv_heads, 0..self.head_dim],
+                        value,
+                    ),
                 }
             } else {
                 self.init_tail_from_frozen(block_id, block_len, key, value)?
@@ -167,18 +173,45 @@ impl<B: Backend<IntElem = i32>> KvCache<B> {
     ) -> Result<TailState<B>> {
         let existing = block_len - 1;
         let base = block_id * self.block_size;
-        let (k, v) = if existing > 0 {
+        let mut k = Tensor::<B, 3>::zeros(
+            [self.block_size, self.num_kv_heads, self.head_dim],
+            &self.device,
+        );
+        let mut v = Tensor::<B, 3>::zeros(
+            [self.block_size, self.num_kv_heads, self.head_dim],
+            &self.device,
+        );
+
+        if existing > 0 {
             let prefix =
                 Tensor::<B, 1, Int>::arange(base as i64..(base + existing) as i64, &self.device);
             let k_prefix = self.k.clone().select(0, prefix.clone());
             let v_prefix = self.v.clone().select(0, prefix);
-            (
-                Tensor::<B, 3>::cat(vec![k_prefix, key], 0),
-                Tensor::<B, 3>::cat(vec![v_prefix, value], 0),
-            )
-        } else {
-            (key, value)
-        };
+            k = k.slice_assign(
+                [0..existing, 0..self.num_kv_heads, 0..self.head_dim],
+                k_prefix,
+            );
+            v = v.slice_assign(
+                [0..existing, 0..self.num_kv_heads, 0..self.head_dim],
+                v_prefix,
+            );
+        }
+        k = k.slice_assign(
+            [
+                existing..existing + 1,
+                0..self.num_kv_heads,
+                0..self.head_dim,
+            ],
+            key,
+        );
+        v = v.slice_assign(
+            [
+                existing..existing + 1,
+                0..self.num_kv_heads,
+                0..self.head_dim,
+            ],
+            value,
+        );
 
         Ok(TailState {
             block_id,
@@ -197,19 +230,33 @@ impl<B: Backend<IntElem = i32>> KvCache<B> {
         if let Some(tail) = self.tails.get(&seq_id) {
             let prefix_len = seq_len.saturating_sub(tail.len);
             if prefix_len == 0 {
-                return Ok((tail.k.clone(), tail.v.clone()));
+                return Ok((
+                    tail.k
+                        .clone()
+                        .slice([0..tail.len, 0..self.num_kv_heads, 0..self.head_dim]),
+                    tail.v
+                        .clone()
+                        .slice([0..tail.len, 0..self.num_kv_heads, 0..self.head_dim]),
+                ));
             }
 
             let prefix_slots = slot_indices.clone().slice([0..prefix_len]);
             let k = Tensor::<B, 3>::cat(
                 vec![
                     self.k.clone().select(0, prefix_slots.clone()),
-                    tail.k.clone(),
+                    tail.k
+                        .clone()
+                        .slice([0..tail.len, 0..self.num_kv_heads, 0..self.head_dim]),
                 ],
                 0,
             );
             let v = Tensor::<B, 3>::cat(
-                vec![self.v.clone().select(0, prefix_slots), tail.v.clone()],
+                vec![
+                    self.v.clone().select(0, prefix_slots),
+                    tail.v
+                        .clone()
+                        .slice([0..tail.len, 0..self.num_kv_heads, 0..self.head_dim]),
+                ],
                 0,
             );
             return Ok((k, v));
