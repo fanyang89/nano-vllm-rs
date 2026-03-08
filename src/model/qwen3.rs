@@ -4,6 +4,7 @@ use burn::tensor::{backend::Backend, DType, Element, Int, Tensor, TensorData};
 use safetensors::{tensor::TensorView, Dtype, SafeTensors};
 
 use crate::config::ModelConfig;
+use crate::engine::kv_cache::KvCache;
 use crate::layers::attention::Attention;
 use crate::layers::rotary_embedding::RotaryEmbedding;
 use crate::utils::context::AttentionContext;
@@ -132,17 +133,12 @@ impl<B: Backend<IntElem = i32>> Qwen3ForCausalLM<B> {
         &self,
         input_ids: &Tensor<B, 1, Int>,
         positions: &Tensor<B, 1, Int>,
-        k_caches: &mut [Tensor<B, 4>],
-        v_caches: &mut [Tensor<B, 4>],
+        kv_caches: &mut [KvCache<B>],
         ctx: &AttentionContext<B>,
     ) -> Result<Tensor<B, 2>> {
         ensure!(
-            k_caches.len() == self.layers.len(),
-            "k cache layer mismatch"
-        );
-        ensure!(
-            v_caches.len() == self.layers.len(),
-            "v cache layer mismatch"
+            kv_caches.len() == self.layers.len(),
+            "kv cache layer mismatch"
         );
 
         let mut hidden_states = self.embed_tokens.clone().select(0, input_ids.clone());
@@ -182,9 +178,7 @@ impl<B: Backend<IntElem = i32>> Qwen3ForCausalLM<B> {
             profiler::sync_backend::<B>(&q.device())?;
             drop(_scope);
             let _scope = Scope::new("layer_attention");
-            let o = layer
-                .attn
-                .forward(&q, &k, &v, &mut k_caches[i], &mut v_caches[i], ctx)?;
+            let o = layer.attn.forward(&q, &k, &v, &mut kv_caches[i], ctx)?;
             profiler::sync_backend::<B>(&o.device())?;
             drop(_scope);
             let n = o.shape().as_slice()[0];

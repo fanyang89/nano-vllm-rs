@@ -3,6 +3,7 @@ use burn::tensor::{backend::Backend, Int, Tensor};
 /// Context passed through the model forward pass to attention layers.
 pub struct AttentionContext<B: Backend> {
     pub is_prefill: bool,
+    pub seq_ids: Vec<usize>,
     /// Cumulative sequence lengths for queries, shape [batch+1], i32.
     pub cu_seqlens_q: Tensor<B, 1, Int>,
     /// Host-side mirror of `cu_seqlens_q` to avoid repeated device synchronization.
@@ -21,6 +22,10 @@ pub struct AttentionContext<B: Backend> {
     pub context_lens: Option<Tensor<B, 1, Int>>,
     /// Host-side mirror of `context_lens` to avoid repeated device synchronization.
     pub context_lens_host: Option<Vec<i32>>,
+    /// Current block id for decode token append.
+    pub last_block_ids: Option<Vec<usize>>,
+    /// Number of valid tokens in the current last block after append.
+    pub last_block_lens: Option<Vec<usize>>,
     /// Per-sequence flat slot indices into the KV cache.
     pub kv_slot_indices: Option<Vec<Tensor<B, 1, Int>>>,
 }

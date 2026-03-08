@@ -1,7 +1,8 @@
-use anyhow::{ensure, Result};
+use anyhow::Result;
 use burn::tensor::activation::softmax;
-use burn::tensor::{backend::Backend, DType, Element, IndexingUpdateOp, Int, Tensor};
+use burn::tensor::{backend::Backend, DType, Element, Int, Tensor};
 
+use crate::engine::kv_cache::KvCache;
 use crate::utils::context::AttentionContext;
 use crate::utils::profiler::{self, Scope};
 
@@ -25,41 +26,31 @@ impl Attention {
 }
 
 impl Attention {
-    pub fn forward<B: Backend>(
+    pub fn forward<B: Backend<IntElem = i32>>(
         &self,
         q: &Tensor<B, 3>,
         k: &Tensor<B, 3>,
         v: &Tensor<B, 3>,
-        k_cache: &mut Tensor<B, 4>,
-        v_cache: &mut Tensor<B, 4>,
+        kv_cache: &mut KvCache<B>,
         ctx: &AttentionContext<B>,
     ) -> Result<Tensor<B, 3>> {
-        let _scope = Scope::new("store_kvcache");
-        store_kvcache(
-            k,
-            v,
-            k_cache,
-            v_cache,
-            &ctx.slot_mapping,
-            &ctx.slot_mapping_host,
-        )?;
-        profiler::sync_backend::<B>(&k_cache.device())?;
-        drop(_scope);
-
         if ctx.is_prefill {
-            self.prefill_attention(q, k, v, k_cache, v_cache, ctx)
+            let _scope = Scope::new("store_kvcache");
+            kv_cache.store_prefill(k, v, &ctx.slot_mapping, &ctx.slot_mapping_host)?;
+            profiler::sync_backend::<B>(kv_cache.device())?;
+            drop(_scope);
+            self.prefill_attention(q, k, v, kv_cache, ctx)
         } else {
-            self.decode_attention(q, k_cache, v_cache, ctx)
+            self.decode_attention(q, k, v, kv_cache, ctx)
         }
     }
 
-    fn prefill_attention<B: Backend>(
+    fn prefill_attention<B: Backend<IntElem = i32>>(
         &self,
         q: &Tensor<B, 3>,
         k: &Tensor<B, 3>,
         v: &Tensor<B, 3>,
-        k_cache: &Tensor<B, 4>,
-        v_cache: &Tensor<B, 4>,
+        kv_cache: &KvCache<B>,
         ctx: &AttentionContext<B>,
     ) -> Result<Tensor<B, 3>> {
         let cu_seqlens_q = &ctx.cu_seqlens_q_host;
@@ -82,12 +73,12 @@ impl Attention {
 
             let (k_i, v_i) = if has_prefix_cache {
                 let _scope = Scope::new("prefill_gather_kv");
-                let out = self.gather_kv_from_cache(
-                    k_cache,
-                    v_cache,
+                let out = kv_cache.gather(
+                    ctx.seq_ids[i],
                     &kv_slot_indices.expect("checked")[i],
+                    k_end,
                 )?;
-                profiler::sync_backend::<B>(&k_cache.device())?;
+                profiler::sync_backend::<B>(kv_cache.device())?;
                 out
             } else {
                 (
@@ -109,11 +100,12 @@ impl Attention {
         Ok(Tensor::<B, 3>::cat(outputs, 0))
     }
 
-    fn decode_attention<B: Backend>(
+    fn decode_attention<B: Backend<IntElem = i32>>(
         &self,
         q: &Tensor<B, 3>,
-        k_cache: &Tensor<B, 4>,
-        v_cache: &Tensor<B, 4>,
+        k: &Tensor<B, 3>,
+        v: &Tensor<B, 3>,
+        kv_cache: &mut KvCache<B>,
         ctx: &AttentionContext<B>,
     ) -> Result<Tensor<B, 3>> {
         let context_lens = ctx
@@ -124,14 +116,40 @@ impl Attention {
             .kv_slot_indices
             .as_ref()
             .expect("decode requires kv_slot_indices");
+        let last_block_ids = ctx
+            .last_block_ids
+            .as_ref()
+            .expect("decode requires last_block_ids");
+        let last_block_lens = ctx
+            .last_block_lens
+            .as_ref()
+            .expect("decode requires last_block_lens");
 
         let batch_size = q.shape().as_slice()[0];
         if batch_size == 1 {
             let ctx_len = context_lens[0] as usize;
             debug_assert_eq!(kv_slot_indices[0].shape().as_slice()[0], ctx_len);
+            let _scope = Scope::new("store_kvcache");
+            let k_i = k
+                .clone()
+                .slice([0..1, 0..self.num_kv_heads, 0..self.head_dim])
+                .reshape([self.num_kv_heads, self.head_dim]);
+            let v_i = v
+                .clone()
+                .slice([0..1, 0..self.num_kv_heads, 0..self.head_dim])
+                .reshape([self.num_kv_heads, self.head_dim]);
+            kv_cache.stage_decode_token(
+                ctx.seq_ids[0],
+                last_block_ids[0],
+                last_block_lens[0],
+                k_i,
+                v_i,
+            )?;
+            profiler::sync_backend::<B>(kv_cache.device())?;
+            drop(_scope);
             let _scope = Scope::new("decode_gather_kv");
-            let (k_i, v_i) = self.gather_kv_from_cache(k_cache, v_cache, &kv_slot_indices[0])?;
-            profiler::sync_backend::<B>(&k_cache.device())?;
+            let (k_i, v_i) = kv_cache.gather(ctx.seq_ids[0], &kv_slot_indices[0], ctx_len)?;
+            profiler::sync_backend::<B>(kv_cache.device())?;
             drop(_scope);
             return self.scaled_dot_product_attention(q, &k_i, &v_i, false);
         }
@@ -142,10 +160,29 @@ impl Attention {
         let mut v_batch = Vec::with_capacity(batch_size);
 
         for (i, &ctx_len) in context_lens.iter().enumerate() {
+            let _scope = Scope::new("store_kvcache");
+            let k_i = k
+                .clone()
+                .slice([i..i + 1, 0..self.num_kv_heads, 0..self.head_dim])
+                .reshape([self.num_kv_heads, self.head_dim]);
+            let v_i = v
+                .clone()
+                .slice([i..i + 1, 0..self.num_kv_heads, 0..self.head_dim])
+                .reshape([self.num_kv_heads, self.head_dim]);
+            kv_cache.stage_decode_token(
+                ctx.seq_ids[i],
+                last_block_ids[i],
+                last_block_lens[i],
+                k_i,
+                v_i,
+            )?;
+            profiler::sync_backend::<B>(kv_cache.device())?;
+            drop(_scope);
             debug_assert_eq!(kv_slot_indices[i].shape().as_slice()[0], ctx_len as usize);
             let _scope = Scope::new("decode_gather_kv");
-            let (k_i, v_i) = self.gather_kv_from_cache(k_cache, v_cache, &kv_slot_indices[i])?;
-            profiler::sync_backend::<B>(&k_cache.device())?;
+            let (k_i, v_i) =
+                kv_cache.gather(ctx.seq_ids[i], &kv_slot_indices[i], ctx_len as usize)?;
+            profiler::sync_backend::<B>(kv_cache.device())?;
             drop(_scope);
 
             let pad_len = max_ctx_len.saturating_sub(ctx_len as usize);
@@ -181,7 +218,7 @@ impl Attention {
         self.batched_decode_attention(q, &k, &v, context_lens)
     }
 
-    fn batched_decode_attention<B: Backend>(
+    fn batched_decode_attention<B: Backend<IntElem = i32>>(
         &self,
         q: &Tensor<B, 3>,
         k: &Tensor<B, 4>,
@@ -222,36 +259,7 @@ impl Attention {
         Ok(out.reshape([batch_size, self.num_heads, self.head_dim]))
     }
 
-    fn gather_kv_from_cache<B: Backend>(
-        &self,
-        k_cache: &Tensor<B, 4>,
-        v_cache: &Tensor<B, 4>,
-        slot_indices: &Tensor<B, 1, Int>,
-    ) -> Result<(Tensor<B, 3>, Tensor<B, 3>)> {
-        let cache_dims = k_cache.shape().as_slice().to_vec();
-        let total_slots = cache_dims[0] * cache_dims[1];
-        let seq_len = slot_indices.shape().as_slice()[0];
-        let k_flat = k_cache
-            .clone()
-            .reshape([total_slots, self.num_kv_heads, self.head_dim]);
-        let v_flat = v_cache
-            .clone()
-            .reshape([total_slots, self.num_kv_heads, self.head_dim]);
-
-        let k = k_flat.select(0, slot_indices.clone()).reshape([
-            seq_len,
-            self.num_kv_heads,
-            self.head_dim,
-        ]);
-        let v = v_flat.select(0, slot_indices.clone()).reshape([
-            seq_len,
-            self.num_kv_heads,
-            self.head_dim,
-        ]);
-        Ok((k, v))
-    }
-
-    fn scaled_dot_product_attention<B: Backend>(
+    fn scaled_dot_product_attention<B: Backend<IntElem = i32>>(
         &self,
         q: &Tensor<B, 3>,
         k: &Tensor<B, 3>,
@@ -299,69 +307,11 @@ impl Attention {
     }
 }
 
-/// Store K/V into paged cache using tensor scatter ops.
-fn store_kvcache<B: Backend>(
-    key: &Tensor<B, 3>,
-    value: &Tensor<B, 3>,
-    k_cache: &mut Tensor<B, 4>,
-    v_cache: &mut Tensor<B, 4>,
-    slot_mapping: &Tensor<B, 1, Int>,
-    slot_mapping_host: &[i32],
-) -> Result<()> {
-    let dims = k_cache.shape().as_slice().to_vec();
-    ensure!(dims.len() == 4, "k_cache must be rank-4");
-    let total_slots = dims[0] * dims[1];
-    let row_width = dims[2] * dims[3];
-
-    let n = key.shape().as_slice()[0];
-
-    if n == 1 && slot_mapping_host.len() == 1 {
-        let slot = slot_mapping_host[0];
-        ensure!(slot >= 0, "decode slot must be non-negative");
-        let slot = slot as usize;
-        ensure!(slot < total_slots, "decode slot out of bounds");
-
-        let key_flat = key.clone().reshape([1, row_width]);
-        let val_flat = value.clone().reshape([1, row_width]);
-        let k_flat = k_cache
-            .clone()
-            .reshape([total_slots, row_width])
-            .slice_assign([slot..slot + 1, 0..row_width], key_flat);
-        let v_flat = v_cache
-            .clone()
-            .reshape([total_slots, row_width])
-            .slice_assign([slot..slot + 1, 0..row_width], val_flat);
-
-        *k_cache = k_flat.reshape([dims[0], dims[1], dims[2], dims[3]]);
-        *v_cache = v_flat.reshape([dims[0], dims[1], dims[2], dims[3]]);
-        return Ok(());
-    }
-
-    let mut slots = slot_mapping.clone();
-    let valid_mask = slots.clone().greater_equal_elem(0);
-    slots = slots.clamp(0, (total_slots.saturating_sub(1)) as i32);
-
-    let indices = slots.unsqueeze_dim::<2>(1).repeat(&[1, row_width]); // [n, row_width]
-    let valid = valid_mask
-        .unsqueeze_dim::<2>(1)
-        .repeat(&[1, row_width])
-        .float();
-
-    let key_flat = key.clone().reshape([n, row_width]).mul(valid.clone());
-    let val_flat = value.clone().reshape([n, row_width]).mul(valid.clone());
-
-    let k_flat = k_cache.clone().reshape([total_slots, row_width]);
-    let v_flat = v_cache.clone().reshape([total_slots, row_width]);
-
-    let k_flat = k_flat.scatter(0, indices.clone(), key_flat, IndexingUpdateOp::Add);
-    let v_flat = v_flat.scatter(0, indices, val_flat, IndexingUpdateOp::Add);
-
-    *k_cache = k_flat.reshape([dims[0], dims[1], dims[2], dims[3]]);
-    *v_cache = v_flat.reshape([dims[0], dims[1], dims[2], dims[3]]);
-    Ok(())
-}
-
-fn create_causal_mask<B: Backend>(q_len: usize, kv_len: usize, device: &B::Device) -> Tensor<B, 3> {
+fn create_causal_mask<B: Backend<IntElem = i32>>(
+    q_len: usize,
+    kv_len: usize,
+    device: &B::Device,
+) -> Tensor<B, 3> {
     let offset = (kv_len as i64 - q_len as i64) as i32;
     let q_idx = Tensor::<B, 1, Int>::arange(0..q_len as i64, device)
         .reshape([q_len, 1])
