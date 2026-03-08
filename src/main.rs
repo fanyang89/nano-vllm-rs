@@ -28,7 +28,7 @@ enum Commands {
     /// Start an interactive chat REPL
     Repl(ReplArgs),
     /// Run benchmark compatible with nano-vllm/bench.py
-    BenchPy(BenchPyArgs),
+    Bench(BenchArgs),
     /// Build a deterministic Qwen3 weight remap plan from safetensors
     ConvertModel(ConvertModelArgs),
 }
@@ -109,7 +109,7 @@ struct ConvertModelArgs {
 }
 
 #[derive(Parser, Debug)]
-struct BenchPyArgs {
+struct BenchArgs {
     /// Path to model directory (containing safetensors + config.json + tokenizer.json)
     #[arg(long)]
     model: String,
@@ -178,7 +178,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Run(args) => run_inference(args),
         Commands::Repl(args) => run_repl(args),
-        Commands::BenchPy(args) => run_benchmark_py(args),
+        Commands::Bench(args) => run_benchmark(args),
         Commands::ConvertModel(args) => run_convert_model(args),
     }
 }
@@ -362,10 +362,10 @@ fn run_repl(args: ReplArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_benchmark_py(args: BenchPyArgs) -> Result<()> {
+fn run_benchmark(args: BenchArgs) -> Result<()> {
     #[cfg(debug_assertions)]
     eprintln!(
-        "Warning: debug build is slow for inference. Use `cargo run --release -- bench-py ...` for real performance."
+        "Warning: debug build is slow for inference. Use `cargo run --release -- bench ...` for real performance."
     );
 
     tracing_subscriber::fmt::init();
