@@ -1,12 +1,12 @@
-use anyhow::{Context, Result, ensure};
-use burn::tensor::Tensor;
+use anyhow::{ensure, Context, Result};
+use burn::tensor::{DType, Tensor};
 use burn_dispatch::Dispatch;
 use rand::Rng;
 
 /// Temperature-based token sampling using the Gumbel-max trick.
 pub fn sample(
     logits: &Tensor<Dispatch, 2>,
-    temperatures: &Tensor<Dispatch, 1>,
+    temperatures: Option<&Tensor<Dispatch, 1>>,
     do_sample: bool,
 ) -> Result<Vec<u32>> {
     let shape = logits.shape();
@@ -16,13 +16,22 @@ pub fn sample(
     let vocab = dims[1];
 
     if !do_sample {
-        let token_ids = logits
-            .clone()
-            .argmax(1)
-            .to_data()
-            .to_vec::<i32>()
-            .context("failed to read argmax token ids")?;
-        return Ok(token_ids.into_iter().map(|id| id as u32).collect());
+        let token_ids = logits.clone().argmax(1).to_data();
+        return match token_ids.dtype {
+            DType::I32 => Ok(token_ids
+                .to_vec::<i32>()
+                .context("failed to read argmax token ids")?
+                .into_iter()
+                .map(|id| id as u32)
+                .collect()),
+            DType::I64 => Ok(token_ids
+                .to_vec::<i64>()
+                .context("failed to read argmax token ids")?
+                .into_iter()
+                .map(|id| id as u32)
+                .collect()),
+            dtype => anyhow::bail!("unsupported argmax dtype: {dtype:?}"),
+        };
     }
 
     let logits = logits
@@ -30,6 +39,7 @@ pub fn sample(
         .to_vec::<f32>()
         .context("failed to read logits tensor data")?;
     let temperatures = temperatures
+        .context("sampling requires temperatures")?
         .to_data()
         .to_vec::<f32>()
         .context("failed to read temperature tensor data")?;
@@ -79,7 +89,7 @@ mod tests {
             &device,
         );
         let temps = Tensor::<Dispatch, 1>::from_data(TensorData::new(vec![1.0f32], [1]), &device);
-        let tokens = sample(&logits, &temps, false).unwrap();
+        let tokens = sample(&logits, Some(&temps), false).unwrap();
         assert_eq!(tokens, vec![2]);
     }
 }

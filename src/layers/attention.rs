@@ -1,9 +1,10 @@
-use anyhow::{Result, ensure};
+use anyhow::{ensure, Result};
 use burn::tensor::activation::softmax;
 use burn::tensor::{IndexingUpdateOp, Int, Tensor};
 use burn_dispatch::Dispatch;
 
 use crate::utils::context::AttentionContext;
+use crate::utils::profiler::Scope;
 
 /// Paged attention with KV cache support.
 pub struct Attention {
@@ -32,7 +33,9 @@ impl Attention {
         v_cache: &mut Tensor<Dispatch, 4>,
         ctx: &AttentionContext,
     ) -> Result<Tensor<Dispatch, 3>> {
+        let _scope = Scope::new("store_kvcache");
         store_kvcache(k, v, k_cache, v_cache, &ctx.slot_mapping)?;
+        drop(_scope);
 
         if ctx.is_prefill {
             self.prefill_attention(q, k, v, k_cache, v_cache, ctx)
@@ -50,10 +53,11 @@ impl Attention {
         v_cache: &Tensor<Dispatch, 4>,
         ctx: &AttentionContext,
     ) -> Result<Tensor<Dispatch, 3>> {
-        let cu_seqlens_q: Vec<i32> = ctx.cu_seqlens_q.to_data().to_vec::<i32>()?;
-        let cu_seqlens_k: Vec<i32> = ctx.cu_seqlens_k.to_data().to_vec::<i32>()?;
+        let cu_seqlens_q = &ctx.cu_seqlens_q_host;
+        let cu_seqlens_k = &ctx.cu_seqlens_k_host;
         let batch_size = cu_seqlens_q.len().saturating_sub(1);
-        let has_prefix_cache = ctx.block_tables.is_some();
+        let kv_slot_indices = ctx.kv_slot_indices.as_ref();
+        let has_prefix_cache = kv_slot_indices.is_some();
 
         let mut outputs = Vec::with_capacity(batch_size);
         for i in 0..batch_size {
@@ -62,20 +66,14 @@ impl Attention {
             let q_len = q_end.saturating_sub(q_start);
             let k_start = cu_seqlens_k[i] as usize;
             let k_end = cu_seqlens_k[i + 1] as usize;
-            let k_len = k_end.saturating_sub(k_start);
 
             let q_i = q
                 .clone()
                 .slice([q_start..q_end, 0..self.num_heads, 0..self.head_dim]);
 
             let (k_i, v_i) = if has_prefix_cache {
-                self.gather_kv_from_cache(
-                    k_cache,
-                    v_cache,
-                    ctx.block_tables.as_ref().expect("checked"),
-                    i,
-                    k_len,
-                )?
+                let _scope = Scope::new("prefill_gather_kv");
+                self.gather_kv_from_cache(k_cache, v_cache, &kv_slot_indices.expect("checked")[i])?
             } else {
                 (
                     k.clone()
@@ -85,7 +83,9 @@ impl Attention {
                 )
             };
 
+            let _scope = Scope::new("prefill_sdpa");
             outputs.push(self.scaled_dot_product_attention(&q_i, &k_i, &v_i, true)?);
+            drop(_scope);
             debug_assert_eq!(q_len, outputs.last().unwrap().shape().as_slice()[0]);
         }
 
@@ -99,56 +99,130 @@ impl Attention {
         v_cache: &Tensor<Dispatch, 4>,
         ctx: &AttentionContext,
     ) -> Result<Tensor<Dispatch, 3>> {
-        let context_lens: Vec<i32> = ctx
-            .context_lens
+        let context_lens = ctx
+            .context_lens_host
             .as_ref()
-            .expect("decode requires context_lens")
-            .to_data()
-            .to_vec::<i32>()?;
+            .expect("decode requires context_lens");
+        let kv_slot_indices = ctx
+            .kv_slot_indices
+            .as_ref()
+            .expect("decode requires kv_slot_indices");
 
         let batch_size = q.shape().as_slice()[0];
-        let mut outputs = Vec::with_capacity(batch_size);
+        let max_ctx_len = context_lens.iter().copied().max().unwrap_or(0) as usize;
+        let device = q.device();
+        let mut k_batch = Vec::with_capacity(batch_size);
+        let mut v_batch = Vec::with_capacity(batch_size);
+
         for (i, &ctx_len) in context_lens.iter().enumerate() {
-            let q_i = q
-                .clone()
-                .slice([i..i + 1, 0..self.num_heads, 0..self.head_dim]);
-            let (k_i, v_i) = self.gather_kv_from_cache(
-                k_cache,
-                v_cache,
-                ctx.block_tables.as_ref().expect("decode block_tables"),
-                i,
-                ctx_len as usize,
-            )?;
-            outputs.push(self.scaled_dot_product_attention(&q_i, &k_i, &v_i, false)?);
+            debug_assert_eq!(kv_slot_indices[i].shape().as_slice()[0], ctx_len as usize);
+            let _scope = Scope::new("decode_gather_kv");
+            let (k_i, v_i) = self.gather_kv_from_cache(k_cache, v_cache, &kv_slot_indices[i])?;
+            drop(_scope);
+
+            let pad_len = max_ctx_len.saturating_sub(ctx_len as usize);
+            let k_i = if pad_len > 0 {
+                Tensor::<Dispatch, 3>::cat(
+                    vec![
+                        k_i,
+                        Tensor::<Dispatch, 3>::zeros(
+                            [pad_len, self.num_kv_heads, self.head_dim],
+                            &device,
+                        ),
+                    ],
+                    0,
+                )
+            } else {
+                k_i
+            };
+            let v_i = if pad_len > 0 {
+                Tensor::<Dispatch, 3>::cat(
+                    vec![
+                        v_i,
+                        Tensor::<Dispatch, 3>::zeros(
+                            [pad_len, self.num_kv_heads, self.head_dim],
+                            &device,
+                        ),
+                    ],
+                    0,
+                )
+            } else {
+                v_i
+            };
+
+            k_batch.push(k_i.unsqueeze_dim::<4>(0));
+            v_batch.push(v_i.unsqueeze_dim::<4>(0));
         }
-        Ok(Tensor::<Dispatch, 3>::cat(outputs, 0))
+
+        let k = Tensor::<Dispatch, 4>::cat(k_batch, 0);
+        let v = Tensor::<Dispatch, 4>::cat(v_batch, 0);
+        self.batched_decode_attention(q, &k, &v, context_lens)
+    }
+
+    fn batched_decode_attention(
+        &self,
+        q: &Tensor<Dispatch, 3>,
+        k: &Tensor<Dispatch, 4>,
+        v: &Tensor<Dispatch, 4>,
+        context_lens: &[i32],
+    ) -> Result<Tensor<Dispatch, 3>> {
+        let _scope = Scope::new("decode_sdpa");
+        let batch_size = q.shape().as_slice()[0];
+        let kv_len = k.shape().as_slice()[1];
+        let groups = self.num_heads / self.num_kv_heads;
+        let qg = q
+            .clone()
+            .reshape([batch_size, self.num_kv_heads, groups, self.head_dim])
+            .unsqueeze_dim::<5>(3);
+        let kg = k.clone().swap_dims(1, 2).unsqueeze_dim::<5>(2);
+        let vg = v.clone().swap_dims(1, 2).unsqueeze_dim::<5>(2);
+        let mut attn = (qg * kg)
+            .sum_dim(4)
+            .squeeze_dim::<4>(4)
+            .mul_scalar(self.scale);
+
+        let mut mask = Vec::with_capacity(batch_size * kv_len);
+        for &len in context_lens {
+            let len = len as usize;
+            mask.extend((0..kv_len).map(|idx| if idx < len { 0.0 } else { f32::NEG_INFINITY }));
+        }
+        let mask = Tensor::<Dispatch, 4>::from_data(
+            burn::tensor::TensorData::new(mask, [batch_size, 1, 1, kv_len]),
+            &attn.device(),
+        );
+        attn = attn + mask;
+
+        let attn = softmax(attn, 3).unsqueeze_dim::<5>(4);
+        let out = (attn * vg).sum_dim(3).squeeze_dim::<4>(3);
+        Ok(out.reshape([batch_size, self.num_heads, self.head_dim]))
     }
 
     fn gather_kv_from_cache(
         &self,
         k_cache: &Tensor<Dispatch, 4>,
         v_cache: &Tensor<Dispatch, 4>,
-        block_tables: &Tensor<Dispatch, 2, Int>,
-        seq_idx: usize,
-        seq_len: usize,
+        slot_indices: &Tensor<Dispatch, 1, Int>,
     ) -> Result<(Tensor<Dispatch, 3>, Tensor<Dispatch, 3>)> {
         let cache_dims = k_cache.shape().as_slice().to_vec();
-        let block_size = cache_dims[1];
-        let blocks_needed = seq_len.div_ceil(block_size);
-        let block_ids = block_tables
+        let total_slots = cache_dims[0] * cache_dims[1];
+        let seq_len = slot_indices.shape().as_slice()[0];
+        let k_flat = k_cache
             .clone()
-            .slice([seq_idx..seq_idx + 1, 0..blocks_needed])
-            .reshape([blocks_needed]);
+            .reshape([total_slots, self.num_kv_heads, self.head_dim]);
+        let v_flat = v_cache
+            .clone()
+            .reshape([total_slots, self.num_kv_heads, self.head_dim]);
 
-        let k_blocks = k_cache.clone().select(0, block_ids.clone());
-        let v_blocks = v_cache.clone().select(0, block_ids);
-
-        let k = k_blocks
-            .reshape([blocks_needed * block_size, self.num_kv_heads, self.head_dim])
-            .slice([0..seq_len, 0..self.num_kv_heads, 0..self.head_dim]);
-        let v = v_blocks
-            .reshape([blocks_needed * block_size, self.num_kv_heads, self.head_dim])
-            .slice([0..seq_len, 0..self.num_kv_heads, 0..self.head_dim]);
+        let k = k_flat.select(0, slot_indices.clone()).reshape([
+            seq_len,
+            self.num_kv_heads,
+            self.head_dim,
+        ]);
+        let v = v_flat.select(0, slot_indices.clone()).reshape([
+            seq_len,
+            self.num_kv_heads,
+            self.head_dim,
+        ]);
         Ok((k, v))
     }
 
@@ -210,7 +284,6 @@ fn store_kvcache(
     let total_slots = dims[0] * dims[1];
     let row_width = dims[2] * dims[3];
 
-    let device = key.device();
     let n = key.shape().as_slice()[0];
 
     let mut slots = slot_mapping.clone();
@@ -229,28 +302,11 @@ fn store_kvcache(
     let k_flat = k_cache.clone().reshape([total_slots, row_width]);
     let v_flat = v_cache.clone().reshape([total_slots, row_width]);
 
-    // Emulate assign semantics via Add scatter:
-    // new = old - old_selected + selected_values
-    let old_k = k_flat.clone().gather(0, indices.clone()).mul(valid.clone());
-    let old_v = v_flat.clone().gather(0, indices.clone()).mul(valid);
-    let k_flat = k_flat.scatter(
-        0,
-        indices.clone(),
-        old_k.mul_scalar(-1.0),
-        IndexingUpdateOp::Add,
-    );
     let k_flat = k_flat.scatter(0, indices.clone(), key_flat, IndexingUpdateOp::Add);
-    let v_flat = v_flat.scatter(
-        0,
-        indices.clone(),
-        old_v.mul_scalar(-1.0),
-        IndexingUpdateOp::Add,
-    );
     let v_flat = v_flat.scatter(0, indices, val_flat, IndexingUpdateOp::Add);
 
     *k_cache = k_flat.reshape([dims[0], dims[1], dims[2], dims[3]]);
     *v_cache = v_flat.reshape([dims[0], dims[1], dims[2], dims[3]]);
-    let _ = device;
     Ok(())
 }
 

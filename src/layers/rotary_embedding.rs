@@ -1,11 +1,11 @@
-use anyhow::{Result, ensure};
+use anyhow::{ensure, Result};
 use burn::tensor::{Int, Tensor, TensorData};
 use burn_dispatch::{Dispatch, DispatchDevice};
 
 pub struct RotaryEmbedding {
     head_dim: usize,
     max_position_embeddings: usize,
-    rope_theta: f64,
+    inv_freq: Tensor<Dispatch, 1>,
 }
 
 impl RotaryEmbedding {
@@ -16,10 +16,17 @@ impl RotaryEmbedding {
         _device: &DispatchDevice,
     ) -> Result<Self> {
         ensure!(head_dim % 2 == 0, "head_dim must be even for RoPE");
+        let half = head_dim / 2;
+        let inv_freq: Vec<f32> = (0..half)
+            .map(|i| {
+                let denom = rope_theta.powf((2.0 * i as f64) / head_dim as f64);
+                (1.0 / denom) as f32
+            })
+            .collect();
         Ok(Self {
             head_dim,
             max_position_embeddings,
-            rope_theta,
+            inv_freq: Tensor::<Dispatch, 1>::from_data(TensorData::new(inv_freq, [half]), _device),
         })
     }
 
@@ -44,14 +51,6 @@ impl RotaryEmbedding {
         let n = q_shape[0];
         let hd = self.head_dim;
         let half = hd / 2;
-        let device = q.device();
-        let inv_freq: Vec<f32> = (0..half)
-            .map(|i| {
-                let denom = self.rope_theta.powf((2.0 * i as f64) / hd as f64);
-                (1.0 / denom) as f32
-            })
-            .collect();
-        let inv_freq = Tensor::<Dispatch, 1>::from_data(TensorData::new(inv_freq, [half]), &device);
 
         // Clamp positions to configured max range before angle construction.
         let pos = positions
@@ -59,7 +58,7 @@ impl RotaryEmbedding {
             .clamp(0, self.max_position_embeddings.saturating_sub(1) as i32)
             .float()
             .reshape([n, 1]);
-        let angles = pos.matmul(inv_freq.unsqueeze_dim::<2>(0)); // [n, half]
+        let angles = pos.matmul(self.inv_freq.clone().unsqueeze_dim::<2>(0)); // [n, half]
         let cos = angles.clone().cos().unsqueeze_dim::<3>(1); // [n,1,half]
         let sin = angles.sin().unsqueeze_dim::<3>(1); // [n,1,half]
 

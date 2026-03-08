@@ -7,6 +7,7 @@ use crate::engine::sequence::Sequence;
 use crate::layers::sampler;
 use crate::model::qwen3::Qwen3ForCausalLM;
 use crate::utils::context::AttentionContext;
+use crate::utils::profiler::Scope;
 
 pub struct ModelRunner {
     model: Qwen3ForCausalLM,
@@ -74,6 +75,25 @@ impl ModelRunner {
         Tensor::<Dispatch, 1, Int>::from_data(TensorData::new(data, [n]), &self.device)
     }
 
+    fn seq_kv_slots(&self, seq: &Sequence, len: usize) -> Vec<i32> {
+        let mut slots = Vec::with_capacity(len);
+        let full_blocks = len / self.block_size;
+        let tail = len % self.block_size;
+
+        for &block_id in seq.block_table.iter().take(full_blocks) {
+            let base = block_id * self.block_size;
+            slots.extend((base..base + self.block_size).map(|slot| slot as i32));
+        }
+
+        if tail > 0 {
+            let block_id = seq.block_table[full_blocks];
+            let base = block_id * self.block_size;
+            slots.extend((base..base + tail).map(|slot| slot as i32));
+        }
+
+        slots
+    }
+
     /// Prepare inputs for prefill phase.
     fn prepare_prefill(
         &self,
@@ -91,6 +111,7 @@ impl ModelRunner {
         let mut max_seqlen_k = 0usize;
         let mut slot_mapping = Vec::new();
         let mut need_block_tables = false;
+        let mut kv_slot_indices = Vec::new();
 
         for seq in seqs {
             let seqlen = seq.len();
@@ -114,6 +135,8 @@ impl ModelRunner {
                 need_block_tables = true;
             }
 
+            kv_slot_indices.push(self.int_tensor_1d(self.seq_kv_slots(seq, seqlen)));
+
             if seq.block_table.is_empty() {
                 continue;
             }
@@ -130,12 +153,8 @@ impl ModelRunner {
             }
         }
 
-        let block_tables = if need_block_tables {
-            Some(self.prepare_block_tables(seqs)?)
-        } else {
-            None
-        };
-
+        let cu_seqlens_q_host = cu_seqlens_q.clone();
+        let cu_seqlens_k_host = cu_seqlens_k.clone();
         let input_ids = self.int_tensor_1d(input_ids);
         let positions = self.int_tensor_1d(positions);
         let slot_mapping = self.int_tensor_1d(slot_mapping);
@@ -145,12 +164,15 @@ impl ModelRunner {
         let ctx = AttentionContext {
             is_prefill: true,
             cu_seqlens_q,
+            cu_seqlens_q_host,
             cu_seqlens_k,
+            cu_seqlens_k_host,
             max_seqlen_q,
             max_seqlen_k,
             slot_mapping,
             context_lens: None,
-            block_tables,
+            context_lens_host: None,
+            kv_slot_indices: need_block_tables.then_some(kv_slot_indices),
         };
 
         Ok((input_ids, positions, ctx))
@@ -169,59 +191,46 @@ impl ModelRunner {
         let mut positions = Vec::new();
         let mut slot_mapping = Vec::new();
         let mut context_lens = Vec::new();
+        let mut kv_slot_indices = Vec::with_capacity(seqs.len());
 
         for seq in seqs {
             input_ids.push(seq.last_token() as i32);
             positions.push((seq.len() - 1) as i32);
             context_lens.push(seq.len() as i32);
+            kv_slot_indices.push(self.int_tensor_1d(self.seq_kv_slots(seq, seq.len())));
             let last_slot =
                 seq.block_table.last().unwrap() * self.block_size + seq.last_block_num_tokens() - 1;
             slot_mapping.push(last_slot as i32);
         }
 
         let n = input_ids.len();
-        let block_tables = self.prepare_block_tables(seqs)?;
-
         let input_ids = self.int_tensor_1d(input_ids);
         let positions = self.int_tensor_1d(positions);
         let slot_mapping = self.int_tensor_1d(slot_mapping);
-        let context_lens_t = self.int_tensor_1d(context_lens);
+        let context_lens_t = self.int_tensor_1d(context_lens.clone());
 
         let cu_seqlens_q: Vec<i32> = (0..=n as i32).collect();
         let cu_seqlens_k = cu_seqlens_q.clone();
+        let cu_seqlens_q_host = cu_seqlens_q.clone();
+        let cu_seqlens_k_host = cu_seqlens_k.clone();
         let cu_seqlens_q = self.int_tensor_1d(cu_seqlens_q);
         let cu_seqlens_k = self.int_tensor_1d(cu_seqlens_k);
 
         let ctx = AttentionContext {
             is_prefill: false,
             cu_seqlens_q,
+            cu_seqlens_q_host,
             cu_seqlens_k,
+            cu_seqlens_k_host,
             max_seqlen_q: 1,
             max_seqlen_k: 1,
             slot_mapping,
             context_lens: Some(context_lens_t),
-            block_tables: Some(block_tables),
+            context_lens_host: Some(context_lens),
+            kv_slot_indices: Some(kv_slot_indices),
         };
 
         Ok((input_ids, positions, ctx))
-    }
-
-    fn prepare_block_tables(&self, seqs: &[&Sequence]) -> Result<Tensor<Dispatch, 2, Int>> {
-        let max_len = seqs.iter().map(|s| s.block_table.len()).max().unwrap_or(0);
-        let mut data = Vec::new();
-        for seq in seqs {
-            for &bid in &seq.block_table {
-                data.push(bid as i32);
-            }
-            for _ in seq.block_table.len()..max_len {
-                data.push(0);
-            }
-        }
-        let n = seqs.len();
-        Ok(Tensor::<Dispatch, 2, Int>::from_data(
-            TensorData::new(data, [n, max_len]),
-            &self.device,
-        ))
     }
 
     fn prepare_temperatures(&self, seqs: &[&Sequence]) -> Tensor<Dispatch, 1> {
@@ -232,12 +241,14 @@ impl ModelRunner {
 
     pub fn run(&mut self, seqs: &[&Sequence], is_prefill: bool) -> Result<Vec<u32>> {
         let (input_ids, positions, ctx) = if is_prefill {
+            let _scope = Scope::new("prepare_prefill");
             self.prepare_prefill(seqs)?
         } else {
+            let _scope = Scope::new("prepare_decode");
             self.prepare_decode(seqs)?
         };
 
-        let temperatures = self.prepare_temperatures(seqs);
+        let _scope = Scope::new("model_forward");
         let hidden_states = self.model.forward(
             &input_ids,
             &positions,
@@ -246,9 +257,14 @@ impl ModelRunner {
             &ctx,
         )?;
 
+        drop(_scope);
+        let _scope = Scope::new("compute_logits");
         let logits = self.model.compute_logits(&hidden_states, &ctx)?;
         let do_sample = seqs.first().is_none_or(|s| s.do_sample);
         debug_assert!(seqs.iter().all(|s| s.do_sample == do_sample));
-        sampler::sample(&logits, &temperatures, do_sample)
+        drop(_scope);
+        let _scope = Scope::new("sample");
+        let temperatures = do_sample.then(|| self.prepare_temperatures(seqs));
+        sampler::sample(&logits, temperatures.as_ref(), do_sample)
     }
 }
