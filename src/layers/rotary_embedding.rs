@@ -56,6 +56,7 @@ impl<B: Backend> RotaryEmbedding<B> {
             .clone()
             .clamp(0, self.max_position_embeddings.saturating_sub(1) as i32)
             .float()
+            .cast(DType::F32)
             .reshape([n, 1]);
         let inv_freq = self.inv_freq.clone().cast(DType::F32);
         let angles = pos.matmul(inv_freq.unsqueeze_dim::<2>(0));
