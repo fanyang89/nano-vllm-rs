@@ -15,12 +15,13 @@ pub fn sample<B: Backend<IntElem = i32>>(
     let vocab = dims[1];
 
     if !do_sample {
+        let logits = logits.clone().cast(DType::F32);
         if batch == 1 {
-            let token_id = logits.clone().argmax(1).into_scalar();
+            let token_id = logits.argmax(1).into_scalar();
             return Ok(vec![token_id as u32]);
         }
 
-        let token_ids = logits.clone().argmax(1).to_data();
+        let token_ids = logits.argmax(1).to_data();
         return match token_ids.dtype {
             DType::I32 => Ok(token_ids
                 .to_vec::<i32>()

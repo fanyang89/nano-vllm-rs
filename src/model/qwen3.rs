@@ -232,7 +232,10 @@ impl<B: Backend<IntElem = i32>> Qwen3ForCausalLM<B> {
             hidden_states.clone()
         };
 
-        Ok(hidden.matmul(self.lm_head_weight_t.clone()))
+        Ok(hidden
+            .cast(DType::F32)
+            .matmul(self.lm_head_weight_t.clone().cast(DType::F32))
+            .cast(native_float_dtype::<B>()))
     }
 
     pub fn num_layers(&self) -> usize {
@@ -241,7 +244,10 @@ impl<B: Backend<IntElem = i32>> Qwen3ForCausalLM<B> {
 }
 
 fn linear_2d<B: Backend>(x: &Tensor<B, 2>, w_out_in: &Tensor<B, 2>) -> Tensor<B, 2> {
-    x.clone().matmul(w_out_in.clone().transpose())
+    x.clone()
+        .cast(DType::F32)
+        .matmul(w_out_in.clone().cast(DType::F32).transpose())
+        .cast(native_float_dtype::<B>())
 }
 
 fn native_float_dtype<B: Backend>() -> DType {
