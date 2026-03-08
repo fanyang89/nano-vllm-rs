@@ -275,6 +275,44 @@ impl<B: Backend<IntElem = i32>> KvCache<B> {
         context_lens: &[i32],
         max_ctx_len: usize,
     ) -> Result<(Tensor<B, 4>, Tensor<B, 4>)> {
+        if context_lens.iter().all(|&len| len as usize == max_ctx_len) {
+            let mut k_batch = Vec::with_capacity(seq_ids.len());
+            let mut v_batch = Vec::with_capacity(seq_ids.len());
+            let mut all_tail_only = true;
+
+            for (&seq_id, &ctx_len_i32) in seq_ids.iter().zip(context_lens.iter()) {
+                let ctx_len = ctx_len_i32 as usize;
+                let Some(tail) = self.tails.get(&seq_id) else {
+                    all_tail_only = false;
+                    break;
+                };
+                if tail.len != ctx_len {
+                    all_tail_only = false;
+                    break;
+                }
+
+                k_batch.push(
+                    tail.k
+                        .clone()
+                        .slice([0..ctx_len, 0..self.num_kv_heads, 0..self.head_dim])
+                        .unsqueeze_dim::<4>(0),
+                );
+                v_batch.push(
+                    tail.v
+                        .clone()
+                        .slice([0..ctx_len, 0..self.num_kv_heads, 0..self.head_dim])
+                        .unsqueeze_dim::<4>(0),
+                );
+            }
+
+            if all_tail_only {
+                return Ok((
+                    Tensor::<B, 4>::cat(k_batch, 0),
+                    Tensor::<B, 4>::cat(v_batch, 0),
+                ));
+            }
+        }
+
         let batch = seq_ids.len();
         let mut k_batch = Tensor::<B, 4>::zeros(
             [batch, max_ctx_len, self.num_kv_heads, self.head_dim],
