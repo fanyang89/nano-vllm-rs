@@ -155,10 +155,6 @@ impl Attention {
         }
 
         let max_ctx_len = context_lens.iter().copied().max().unwrap_or(0) as usize;
-        let device = q.device();
-        let mut k_batch = Vec::with_capacity(batch_size);
-        let mut v_batch = Vec::with_capacity(batch_size);
-
         for (i, &ctx_len) in context_lens.iter().enumerate() {
             let _scope = Scope::new("store_kvcache");
             let k_i = k
@@ -179,42 +175,17 @@ impl Attention {
             profiler::sync_backend::<B>(kv_cache.device())?;
             drop(_scope);
             debug_assert_eq!(kv_slot_indices[i].shape().as_slice()[0], ctx_len as usize);
-            let _scope = Scope::new("decode_gather_kv");
-            let (k_i, v_i) =
-                kv_cache.gather(ctx.seq_ids[i], &kv_slot_indices[i], ctx_len as usize)?;
-            profiler::sync_backend::<B>(kv_cache.device())?;
-            drop(_scope);
-
-            let pad_len = max_ctx_len.saturating_sub(ctx_len as usize);
-            let k_i = if pad_len > 0 {
-                Tensor::<B, 3>::cat(
-                    vec![
-                        k_i,
-                        Tensor::<B, 3>::zeros([pad_len, self.num_kv_heads, self.head_dim], &device),
-                    ],
-                    0,
-                )
-            } else {
-                k_i
-            };
-            let v_i = if pad_len > 0 {
-                Tensor::<B, 3>::cat(
-                    vec![
-                        v_i,
-                        Tensor::<B, 3>::zeros([pad_len, self.num_kv_heads, self.head_dim], &device),
-                    ],
-                    0,
-                )
-            } else {
-                v_i
-            };
-
-            k_batch.push(k_i.unsqueeze_dim::<4>(0));
-            v_batch.push(v_i.unsqueeze_dim::<4>(0));
         }
 
-        let k = Tensor::<B, 4>::cat(k_batch, 0);
-        let v = Tensor::<B, 4>::cat(v_batch, 0);
+        let _scope = Scope::new("decode_gather_kv");
+        let (k, v) = kv_cache.gather_padded_batch(
+            &ctx.seq_ids,
+            kv_slot_indices,
+            context_lens,
+            max_ctx_len,
+        )?;
+        profiler::sync_backend::<B>(kv_cache.device())?;
+        drop(_scope);
         self.batched_decode_attention(q, &k, &v, context_lens)
     }
 

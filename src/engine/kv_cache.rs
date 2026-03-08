@@ -268,6 +268,43 @@ impl<B: Backend<IntElem = i32>> KvCache<B> {
         ))
     }
 
+    pub fn gather_padded_batch(
+        &self,
+        seq_ids: &[usize],
+        slot_indices: &[Tensor<B, 1, Int>],
+        context_lens: &[i32],
+        max_ctx_len: usize,
+    ) -> Result<(Tensor<B, 4>, Tensor<B, 4>)> {
+        let batch = seq_ids.len();
+        let mut k_batch = Tensor::<B, 4>::zeros(
+            [batch, max_ctx_len, self.num_kv_heads, self.head_dim],
+            &self.device,
+        );
+        let mut v_batch = Tensor::<B, 4>::zeros(
+            [batch, max_ctx_len, self.num_kv_heads, self.head_dim],
+            &self.device,
+        );
+
+        for (i, (&seq_id, &ctx_len_i32)) in seq_ids.iter().zip(context_lens.iter()).enumerate() {
+            let ctx_len = ctx_len_i32 as usize;
+            if ctx_len == 0 {
+                continue;
+            }
+
+            let (k_i, v_i) = self.gather(seq_id, &slot_indices[i], ctx_len)?;
+            k_batch = k_batch.slice_assign(
+                [i..i + 1, 0..ctx_len, 0..self.num_kv_heads, 0..self.head_dim],
+                k_i.unsqueeze_dim::<4>(0),
+            );
+            v_batch = v_batch.slice_assign(
+                [i..i + 1, 0..ctx_len, 0..self.num_kv_heads, 0..self.head_dim],
+                v_i.unsqueeze_dim::<4>(0),
+            );
+        }
+
+        Ok((k_batch, v_batch))
+    }
+
     pub fn clear_sequence(&mut self, seq_id: usize) {
         self.tails.remove(&seq_id);
     }
