@@ -1,19 +1,18 @@
 use anyhow::{ensure, Result};
-use burn::tensor::{Int, Tensor, TensorData};
-use burn_dispatch::{Dispatch, DispatchDevice};
+use burn::tensor::{backend::Backend, Int, Tensor, TensorData};
 
-pub struct RotaryEmbedding {
+pub struct RotaryEmbedding<B: Backend> {
     head_dim: usize,
     max_position_embeddings: usize,
-    inv_freq: Tensor<Dispatch, 1>,
+    inv_freq: Tensor<B, 1>,
 }
 
-impl RotaryEmbedding {
+impl<B: Backend> RotaryEmbedding<B> {
     pub fn new(
         head_dim: usize,
         max_position_embeddings: usize,
         rope_theta: f64,
-        _device: &DispatchDevice,
+        device: &B::Device,
     ) -> Result<Self> {
         ensure!(head_dim % 2 == 0, "head_dim must be even for RoPE");
         let half = head_dim / 2;
@@ -26,16 +25,16 @@ impl RotaryEmbedding {
         Ok(Self {
             head_dim,
             max_position_embeddings,
-            inv_freq: Tensor::<Dispatch, 1>::from_data(TensorData::new(inv_freq, [half]), _device),
+            inv_freq: Tensor::<B, 1>::from_data(TensorData::new(inv_freq, [half]), device),
         })
     }
 
     pub fn forward(
         &self,
-        positions: &Tensor<Dispatch, 1, Int>,
-        q: &Tensor<Dispatch, 3>,
-        k: &Tensor<Dispatch, 3>,
-    ) -> Result<(Tensor<Dispatch, 3>, Tensor<Dispatch, 3>)> {
+        positions: &Tensor<B, 1, Int>,
+        q: &Tensor<B, 3>,
+        k: &Tensor<B, 3>,
+    ) -> Result<(Tensor<B, 3>, Tensor<B, 3>)> {
         let q_shape = q.shape().as_slice().to_vec();
         let k_shape = k.shape().as_slice().to_vec();
         ensure!(
@@ -72,8 +71,8 @@ impl RotaryEmbedding {
         let k_rot_1 = k1.clone() * cos.clone() - k2.clone() * sin.clone();
         let k_rot_2 = k2 * cos + k1 * sin;
 
-        let q_out = Tensor::<Dispatch, 3>::cat(vec![q_rot_1, q_rot_2], 2);
-        let k_out = Tensor::<Dispatch, 3>::cat(vec![k_rot_1, k_rot_2], 2);
+        let q_out = Tensor::<B, 3>::cat(vec![q_rot_1, q_rot_2], 2);
+        let k_out = Tensor::<B, 3>::cat(vec![k_rot_1, k_rot_2], 2);
         Ok((q_out, k_out))
     }
 }

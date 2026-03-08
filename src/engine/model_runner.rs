@@ -1,6 +1,5 @@
 use anyhow::Result;
-use burn::tensor::{Int, Tensor, TensorData};
-use burn_dispatch::{Dispatch, DispatchDevice};
+use burn::tensor::{backend::Backend, Int, Tensor, TensorData};
 
 use crate::config::{EngineConfig, ModelConfig};
 use crate::engine::sequence::Sequence;
@@ -9,22 +8,22 @@ use crate::model::qwen3::Qwen3ForCausalLM;
 use crate::utils::context::AttentionContext;
 use crate::utils::profiler::Scope;
 
-pub struct ModelRunner {
-    model: Qwen3ForCausalLM,
-    k_caches: Vec<Tensor<Dispatch, 4>>,
-    v_caches: Vec<Tensor<Dispatch, 4>>,
+pub struct ModelRunner<B: Backend<IntElem = i32>> {
+    model: Qwen3ForCausalLM<B>,
+    k_caches: Vec<Tensor<B, 4>>,
+    v_caches: Vec<Tensor<B, 4>>,
     block_size: usize,
-    device: DispatchDevice,
+    device: B::Device,
 }
 
-impl ModelRunner {
+impl<B: Backend<IntElem = i32>> ModelRunner<B> {
     pub fn new(
         engine_config: &mut EngineConfig,
         model_config: &ModelConfig,
-        device: DispatchDevice,
+        device: B::Device,
     ) -> Result<Self> {
         let model_path = &engine_config.model_path;
-        let model = Qwen3ForCausalLM::new(model_config, model_path, &device)?;
+        let model = Qwen3ForCausalLM::<B>::new(model_config, model_path, &device)?;
 
         let (k_caches, v_caches, num_blocks) =
             Self::allocate_kv_cache(engine_config, model_config, &model, &device)?;
@@ -42,9 +41,9 @@ impl ModelRunner {
     fn allocate_kv_cache(
         engine_config: &EngineConfig,
         model_config: &ModelConfig,
-        model: &Qwen3ForCausalLM,
-        device: &DispatchDevice,
-    ) -> Result<(Vec<Tensor<Dispatch, 4>>, Vec<Tensor<Dispatch, 4>>, usize)> {
+        model: &Qwen3ForCausalLM<B>,
+        device: &B::Device,
+    ) -> Result<(Vec<Tensor<B, 4>>, Vec<Tensor<B, 4>>, usize)> {
         let num_layers = model.num_layers();
         let num_kv_heads = model_config.num_key_value_heads;
         let head_dim = model_config.head_dim();
@@ -57,11 +56,11 @@ impl ModelRunner {
         let mut v_caches = Vec::with_capacity(num_layers);
 
         for _ in 0..num_layers {
-            k_caches.push(Tensor::<Dispatch, 4>::zeros(
+            k_caches.push(Tensor::<B, 4>::zeros(
                 [num_blocks, block_size, num_kv_heads, head_dim],
                 device,
             ));
-            v_caches.push(Tensor::<Dispatch, 4>::zeros(
+            v_caches.push(Tensor::<B, 4>::zeros(
                 [num_blocks, block_size, num_kv_heads, head_dim],
                 device,
             ));
@@ -70,9 +69,9 @@ impl ModelRunner {
         Ok((k_caches, v_caches, num_blocks))
     }
 
-    fn int_tensor_1d(&self, data: Vec<i32>) -> Tensor<Dispatch, 1, Int> {
+    fn int_tensor_1d(&self, data: Vec<i32>) -> Tensor<B, 1, Int> {
         let n = data.len();
-        Tensor::<Dispatch, 1, Int>::from_data(TensorData::new(data, [n]), &self.device)
+        Tensor::<B, 1, Int>::from_data(TensorData::new(data, [n]), &self.device)
     }
 
     fn seq_kv_slots(&self, seq: &Sequence, len: usize) -> Vec<i32> {
@@ -94,15 +93,10 @@ impl ModelRunner {
         slots
     }
 
-    /// Prepare inputs for prefill phase.
     fn prepare_prefill(
         &self,
         seqs: &[&Sequence],
-    ) -> Result<(
-        Tensor<Dispatch, 1, Int>,
-        Tensor<Dispatch, 1, Int>,
-        AttentionContext,
-    )> {
+    ) -> Result<(Tensor<B, 1, Int>, Tensor<B, 1, Int>, AttentionContext<B>)> {
         let mut input_ids = Vec::new();
         let mut positions = Vec::new();
         let mut cu_seqlens_q = vec![0i32];
@@ -178,15 +172,10 @@ impl ModelRunner {
         Ok((input_ids, positions, ctx))
     }
 
-    /// Prepare inputs for decode phase.
     fn prepare_decode(
         &self,
         seqs: &[&Sequence],
-    ) -> Result<(
-        Tensor<Dispatch, 1, Int>,
-        Tensor<Dispatch, 1, Int>,
-        AttentionContext,
-    )> {
+    ) -> Result<(Tensor<B, 1, Int>, Tensor<B, 1, Int>, AttentionContext<B>)> {
         let mut input_ids = Vec::new();
         let mut positions = Vec::new();
         let mut slot_mapping = Vec::new();
@@ -233,10 +222,10 @@ impl ModelRunner {
         Ok((input_ids, positions, ctx))
     }
 
-    fn prepare_temperatures(&self, seqs: &[&Sequence]) -> Tensor<Dispatch, 1> {
+    fn prepare_temperatures(&self, seqs: &[&Sequence]) -> Tensor<B, 1> {
         let temps: Vec<f32> = seqs.iter().map(|s| s.temperature).collect();
         let n = temps.len();
-        Tensor::<Dispatch, 1>::from_data(TensorData::new(temps, [n]), &self.device)
+        Tensor::<B, 1>::from_data(TensorData::new(temps, [n]), &self.device)
     }
 
     pub fn run(&mut self, seqs: &[&Sequence], is_prefill: bool) -> Result<Vec<u32>> {
