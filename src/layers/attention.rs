@@ -210,19 +210,23 @@ impl Attention {
             .sum_dim(4)
             .squeeze_dim::<4>(4)
             .mul_scalar(self.scale);
-
-        let mut mask = Vec::with_capacity(batch_size * kv_len);
-        for &len in context_lens {
-            let len = len as usize;
-            mask.extend((0..kv_len).map(|idx| if idx < len { 0.0 } else { f32::NEG_INFINITY }));
-        }
-        let mask = Tensor::<B, 4>::from_data(
-            burn::tensor::TensorData::new(mask, [batch_size, 1, 1, kv_len]),
-            &attn.device(),
-        )
-        .cast(DType::F32);
         let native_dtype = <B::FloatElem as Element>::dtype();
-        attn = attn.cast(DType::F32) + mask;
+
+        if context_lens.iter().any(|&len| len as usize != kv_len) {
+            let mut mask = Vec::with_capacity(batch_size * kv_len);
+            for &len in context_lens {
+                let len = len as usize;
+                mask.extend((0..kv_len).map(|idx| if idx < len { 0.0 } else { f32::NEG_INFINITY }));
+            }
+            let mask = Tensor::<B, 4>::from_data(
+                burn::tensor::TensorData::new(mask, [batch_size, 1, 1, kv_len]),
+                &attn.device(),
+            )
+            .cast(DType::F32);
+            attn = attn.cast(DType::F32) + mask;
+        } else {
+            attn = attn.cast(DType::F32);
+        }
 
         let attn = softmax(attn, 3).cast(native_dtype).unsqueeze_dim::<5>(4);
         let out = (attn * vg).sum_dim(3).squeeze_dim::<4>(3);
