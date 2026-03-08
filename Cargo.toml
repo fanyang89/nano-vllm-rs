@@ -6,12 +6,14 @@ edition = "2024"
 [features]
 default = ["cpu"]
 cpu = ["burn-dispatch/ndarray", "dep:burn-ndarray"]
+cuda = ["burn-dispatch/cuda", "dep:burn-cuda"]
 rocm = ["burn-dispatch/rocm", "dep:burn-rocm"]
 
 [dependencies]
 anyhow = "1"
 burn = { version = "0.21.0-pre.2", default-features = false, features = ["std"] }
 burn-dispatch = { version = "0.21.0-pre.2", default-features = false, features = ["std"] }
+burn-cuda = { version = "0.21.0-pre.2", default-features = false, optional = true }
 burn-ndarray = { version = "0.21.0-pre.2", default-features = false, optional = true }
 burn-rocm = { version = "0.21.0-pre.2", default-features = false, optional = true }
 clap = { version = "4", features = ["derive"] }

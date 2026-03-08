@@ -18,6 +18,7 @@ use serde::Serialize;
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum CliDevice {
     Cpu,
+    Cuda,
     Rocm,
 }
 
@@ -266,6 +267,7 @@ fn run_inference(args: RunArgs) -> Result<()> {
     println!("Loading model from: {}", args.model);
     let runtime_device = match args.device {
         CliDevice::Cpu => RuntimeDevice::Cpu,
+        CliDevice::Cuda => RuntimeDevice::Cuda,
         CliDevice::Rocm => RuntimeDevice::Rocm,
     };
     let mut engine = LLMEngine::new(&args.model, runtime_device)?;
@@ -297,6 +299,7 @@ fn run_repl(args: ReplArgs) -> Result<()> {
     println!("Loading model from: {}", args.model);
     let runtime_device = match args.device {
         CliDevice::Cpu => RuntimeDevice::Cpu,
+        CliDevice::Cuda => RuntimeDevice::Cuda,
         CliDevice::Rocm => RuntimeDevice::Rocm,
     };
     let model_config = ModelConfig::from_dir(Path::new(&args.model))?;
@@ -373,6 +376,7 @@ fn run_benchmark(args: BenchArgs) -> Result<()> {
     println!("Loading model from: {}", args.model);
     let runtime_device = match args.device {
         CliDevice::Cpu => RuntimeDevice::Cpu,
+        CliDevice::Cuda => RuntimeDevice::Cuda,
         CliDevice::Rocm => RuntimeDevice::Rocm,
     };
     let mut engine = LLMEngine::new(&args.model, runtime_device)?;

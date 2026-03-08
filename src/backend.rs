@@ -3,6 +3,9 @@ use burn::tensor::backend::Backend;
 #[cfg(feature = "cpu")]
 pub type CpuBackend = burn_ndarray::NdArray<f32, i32, i8>;
 
+#[cfg(feature = "cuda")]
+pub type CudaBackend = burn_cuda::Cuda<half::bf16, i32>;
+
 #[cfg(feature = "rocm")]
 pub type RocmBackend = burn_rocm::Rocm<half::bf16, i32, u8>;
 

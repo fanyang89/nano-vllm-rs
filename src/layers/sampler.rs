@@ -84,7 +84,7 @@ pub fn sample<B: Backend<IntElem = i32>>(
     Ok(out)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu"))]
 mod tests {
     use super::*;
     use crate::backend::CpuBackend;

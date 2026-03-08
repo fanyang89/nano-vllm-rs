@@ -8,6 +8,8 @@ use serde::Deserialize;
 
 #[cfg(feature = "cpu")]
 use crate::backend::CpuBackend;
+#[cfg(feature = "cuda")]
+use crate::backend::CudaBackend;
 #[cfg(feature = "rocm")]
 use crate::backend::RocmBackend;
 use crate::chat::{ChatFormat, format_single_prompt};
@@ -53,12 +55,15 @@ pub struct GenerationStats {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeDevice {
     Cpu,
+    Cuda,
     Rocm,
 }
 
 pub enum LLMEngine {
     #[cfg(feature = "cpu")]
     Cpu(LLMEngineImpl<CpuBackend>),
+    #[cfg(feature = "cuda")]
+    Cuda(LLMEngineImpl<CudaBackend>),
     #[cfg(feature = "rocm")]
     Rocm(LLMEngineImpl<RocmBackend>),
 }
@@ -99,6 +104,18 @@ impl LLMEngine {
                 )
             }
 
+            #[cfg(feature = "cuda")]
+            RuntimeDevice::Cuda => Ok(Self::Cuda(LLMEngineImpl::<CudaBackend>::new(
+                model_path,
+                burn_cuda::CudaDevice::default(),
+            )?)),
+            #[cfg(not(feature = "cuda"))]
+            RuntimeDevice::Cuda => {
+                anyhow::bail!(
+                    "CUDA requested but this binary was built without `cuda` feature support"
+                )
+            }
+
             #[cfg(feature = "rocm")]
             RuntimeDevice::Rocm => Ok(Self::Rocm(LLMEngineImpl::<RocmBackend>::new(
                 model_path,
@@ -117,6 +134,8 @@ impl LLMEngine {
         match self {
             #[cfg(feature = "cpu")]
             Self::Cpu(engine) => engine.add_request(prompt, sampling_params),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(engine) => engine.add_request(prompt, sampling_params),
             #[cfg(feature = "rocm")]
             Self::Rocm(engine) => engine.add_request(prompt, sampling_params),
         }
@@ -130,6 +149,8 @@ impl LLMEngine {
         match self {
             #[cfg(feature = "cpu")]
             Self::Cpu(engine) => engine.add_formatted_request(prompt, sampling_params),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(engine) => engine.add_formatted_request(prompt, sampling_params),
             #[cfg(feature = "rocm")]
             Self::Rocm(engine) => engine.add_formatted_request(prompt, sampling_params),
         }
@@ -143,6 +164,8 @@ impl LLMEngine {
         match self {
             #[cfg(feature = "cpu")]
             Self::Cpu(engine) => engine.add_request_token_ids(prompt_token_ids, sampling_params),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(engine) => engine.add_request_token_ids(prompt_token_ids, sampling_params),
             #[cfg(feature = "rocm")]
             Self::Rocm(engine) => engine.add_request_token_ids(prompt_token_ids, sampling_params),
         }
@@ -221,6 +244,12 @@ impl LLMEngine {
                 sampling_params,
                 progress,
             ),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(engine) => engine.generate_token_ids_batch_with_stats(
+                prompt_token_ids,
+                sampling_params,
+                progress,
+            ),
             #[cfg(feature = "rocm")]
             Self::Rocm(engine) => engine.generate_token_ids_batch_with_stats(
                 prompt_token_ids,
@@ -252,6 +281,10 @@ impl LLMEngine {
             Self::Cpu(engine) => {
                 engine.generate_with_stats_impl(prompts, sampling_params, progress, true)
             }
+            #[cfg(feature = "cuda")]
+            Self::Cuda(engine) => {
+                engine.generate_with_stats_impl(prompts, sampling_params, progress, true)
+            }
             #[cfg(feature = "rocm")]
             Self::Rocm(engine) => {
                 engine.generate_with_stats_impl(prompts, sampling_params, progress, true)
@@ -268,6 +301,8 @@ impl LLMEngine {
         match self {
             #[cfg(feature = "cpu")]
             Self::Cpu(engine) => engine.generate_with_stats(prompts, sampling_params, progress),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(engine) => engine.generate_with_stats(prompts, sampling_params, progress),
             #[cfg(feature = "rocm")]
             Self::Rocm(engine) => engine.generate_with_stats(prompts, sampling_params, progress),
         }

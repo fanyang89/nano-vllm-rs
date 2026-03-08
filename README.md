@@ -19,8 +19,15 @@ Run on ROCm (build with the `rocm` feature):
 cargo run --release --features rocm -- run --device rocm --model ./models/Qwen3-0.6B --prompt "Hello"
 ```
 
+Run on CUDA with bf16 (build with the `cuda` feature):
+
+```bash
+cargo run --release --features cuda -- run --device cuda --model ./models/Qwen3-0.6B --prompt "Hello"
+```
+
 Notes:
-- The tensor and model runner path now uses Burn with the `Dispatch` backend on CPU and ROCm devices.
+- The tensor and model runner path now uses Burn with the `Dispatch` backend on CPU, CUDA, and ROCm devices.
+- The CUDA path uses `bf16`, which requires NVIDIA hardware with native bf16 support and a working CUDA 12.x toolchain.
 - Full paged attention and the rotary path are still being refined in later optimization stages.
 
 ## Chat REPL
@@ -73,6 +80,7 @@ Task shortcuts:
 
 ```bash
 task bench-cpu
+task bench-cuda
 task bench-rocm
 ```
 
@@ -80,7 +88,7 @@ Recommended benchmark protocol:
 1. Run at least one warmup iteration (`--warmup 1` or more).
 2. Compare `decode_steady_tps` across versions for steady-state decode performance.
 3. Sweep `--repeat-prompt` (e.g. `1, 2, 4, 8`) to evaluate batching/concurrency scaling.
-4. Keep prompt and `--max-tokens` fixed when comparing CPU/ROCm or different commits.
+4. Keep prompt and `--max-tokens` fixed when comparing CPU/CUDA/ROCm or different commits.
 
 ## Weight Conversion
 
