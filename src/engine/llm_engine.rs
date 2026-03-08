@@ -106,6 +106,19 @@ impl LLMEngine {
         }
     }
 
+    pub fn add_request_token_ids(
+        &mut self,
+        prompt_token_ids: Vec<u32>,
+        sampling_params: &SamplingParams,
+    ) -> Result<()> {
+        match self {
+            #[cfg(feature = "cpu")]
+            Self::Cpu(engine) => engine.add_request_token_ids(prompt_token_ids, sampling_params),
+            #[cfg(feature = "rocm")]
+            Self::Rocm(engine) => engine.add_request_token_ids(prompt_token_ids, sampling_params),
+        }
+    }
+
     pub fn generate(
         &mut self,
         prompts: &[&str],
@@ -114,6 +127,39 @@ impl LLMEngine {
     ) -> Result<Vec<GenerationOutput>> {
         let (outputs, _stats) = self.generate_with_stats(prompts, sampling_params, use_tqdm)?;
         Ok(outputs)
+    }
+
+    pub fn generate_token_ids_batch(
+        &mut self,
+        prompt_token_ids: &[Vec<u32>],
+        sampling_params: &[SamplingParams],
+        use_tqdm: bool,
+    ) -> Result<Vec<GenerationOutput>> {
+        let (outputs, _stats) =
+            self.generate_token_ids_batch_with_stats(prompt_token_ids, sampling_params, use_tqdm)?;
+        Ok(outputs)
+    }
+
+    pub fn generate_token_ids_batch_with_stats(
+        &mut self,
+        prompt_token_ids: &[Vec<u32>],
+        sampling_params: &[SamplingParams],
+        use_tqdm: bool,
+    ) -> Result<(Vec<GenerationOutput>, GenerationStats)> {
+        match self {
+            #[cfg(feature = "cpu")]
+            Self::Cpu(engine) => engine.generate_token_ids_batch_with_stats(
+                prompt_token_ids,
+                sampling_params,
+                use_tqdm,
+            ),
+            #[cfg(feature = "rocm")]
+            Self::Rocm(engine) => engine.generate_token_ids_batch_with_stats(
+                prompt_token_ids,
+                sampling_params,
+                use_tqdm,
+            ),
+        }
     }
 
     pub fn generate_with_stats(
@@ -198,6 +244,14 @@ impl<B: Backend<IntElem = i32>> LLMEngineImpl<B> {
             .encode(prompt, false)
             .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
         let token_ids: Vec<u32> = encoding.get_ids().to_vec();
+        self.add_request_token_ids(token_ids, sampling_params)
+    }
+
+    fn add_request_token_ids(
+        &mut self,
+        token_ids: Vec<u32>,
+        sampling_params: &SamplingParams,
+    ) -> Result<()> {
         let seq = Sequence::new(token_ids, sampling_params, self.block_size);
         self.scheduler.add(seq);
         Ok(())
@@ -327,6 +381,116 @@ impl<B: Backend<IntElem = i32>> LLMEngineImpl<B> {
         let mut sorted: Vec<_> = outputs.into_iter().collect();
         sorted.sort_by_key(|(id, _)| *id);
 
+        let results: Vec<GenerationOutput> = sorted
+            .into_iter()
+            .map(|(_, token_ids)| {
+                let text = self.tokenizer.decode(&token_ids, true).unwrap_or_default();
+                GenerationOutput { text, token_ids }
+            })
+            .collect();
+
+        if let Some(report) = profiler::report() {
+            println!("{report}");
+        }
+
+        Ok((results, stats))
+    }
+
+    fn generate_token_ids_batch_with_stats(
+        &mut self,
+        prompt_token_ids: &[Vec<u32>],
+        sampling_params: &[SamplingParams],
+        use_tqdm: bool,
+    ) -> Result<(Vec<GenerationOutput>, GenerationStats)> {
+        anyhow::ensure!(
+            prompt_token_ids.len() == sampling_params.len(),
+            "prompt_token_ids and sampling_params length mismatch"
+        );
+
+        profiler::reset();
+        for (prompt, params) in prompt_token_ids.iter().zip(sampling_params.iter()) {
+            self.add_request_token_ids(prompt.clone(), params)?;
+        }
+
+        let total_start = Instant::now();
+        let pb = if use_tqdm {
+            let total_tokens = sampling_params
+                .iter()
+                .map(|sp| sp.max_tokens)
+                .sum::<usize>() as u64;
+            let pb = ProgressBar::new(total_tokens);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("{msg} [{bar:40}] {pos}/{len}")
+                    .unwrap()
+                    .progress_chars("=> "),
+            );
+            Some(pb)
+        } else {
+            None
+        };
+
+        let mut outputs: HashMap<usize, Vec<u32>> = HashMap::new();
+        let mut stats = GenerationStats::default();
+        let mut seen_decode_step = false;
+        let mut last_pb_update = Instant::now();
+
+        while !self.scheduler.is_finished() {
+            let t = Instant::now();
+            let (finished, num_tokens, generated_tokens) = self.step()?;
+            let elapsed = t.elapsed().as_secs_f64();
+
+            if num_tokens > 0 {
+                stats.prefill_tokens += num_tokens as u64;
+                stats.prefill_time_s += elapsed;
+            } else {
+                let decode_tokens = (-num_tokens) as u64;
+                stats.decode_tokens += decode_tokens;
+                stats.decode_time_s += elapsed;
+                if seen_decode_step {
+                    stats.decode_steady_tokens += decode_tokens;
+                    stats.decode_steady_time_s += elapsed;
+                } else {
+                    seen_decode_step = true;
+                    stats.first_decode_latency_s = Some(total_start.elapsed().as_secs_f64());
+                }
+            }
+
+            for (seq_id, token_ids) in finished {
+                outputs.insert(seq_id, token_ids);
+            }
+
+            if let Some(pb) = &pb {
+                let remaining = pb.length().unwrap_or(0).saturating_sub(pb.position());
+                pb.inc((generated_tokens as u64).min(remaining));
+            }
+
+            if let Some(pb) = &pb {
+                if last_pb_update.elapsed().as_millis() >= 100 {
+                    let decode_steady_tps = if stats.decode_steady_time_s > 0.0 {
+                        stats.decode_steady_tokens as f64 / stats.decode_steady_time_s
+                    } else {
+                        0.0
+                    };
+                    pb.set_message(format!("Decode(steady): {:.0} tok/s", decode_steady_tps));
+                    last_pb_update = Instant::now();
+                }
+            }
+        }
+
+        if let Some(pb) = &pb {
+            if let Some(len) = pb.length() {
+                let pos = pb.position();
+                if pos < len {
+                    pb.set_length(pos);
+                }
+            }
+            pb.finish();
+        }
+        stats.total_time_s = total_start.elapsed().as_secs_f64();
+
+        let mut sorted: Vec<_> = outputs.into_iter().collect();
+        sorted.sort_by_key(|(id, _)| *id);
         let results: Vec<GenerationOutput> = sorted
             .into_iter()
             .map(|(_, token_ids)| {

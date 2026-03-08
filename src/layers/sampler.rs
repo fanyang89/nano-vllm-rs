@@ -39,11 +39,15 @@ pub fn sample<B: Backend<IntElem = i32>>(
     }
 
     let logits = logits
+        .clone()
+        .cast(DType::F32)
         .to_data()
         .to_vec::<f32>()
         .context("failed to read logits tensor data")?;
     let temperatures = temperatures
         .context("sampling requires temperatures")?
+        .clone()
+        .cast(DType::F32)
         .to_data()
         .to_vec::<f32>()
         .context("failed to read temperature tensor data")?;
