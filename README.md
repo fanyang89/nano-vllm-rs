@@ -1,28 +1,48 @@
 # nano-vllm-rs
 
-## Run
+## Overview
 
-CPU:
+`nano-vllm-rs` is a lightweight vLLM-style inference engine written in Rust with [Burn](https://burn.dev),
+inspired by [GeeeekExplorer/nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)
+
+## Run Inference
+
+Run on CPU:
 
 ```bash
 cargo run --release -- run --device cpu --model ./models/Qwen3-0.6B --prompt "Hello"
 ```
 
-ROCm migration target (build with feature):
+Run on ROCm (build with the `rocm` feature):
 
 ```bash
 cargo run --release --features rocm -- run --device rocm --model ./models/Qwen3-0.6B --prompt "Hello"
 ```
 
-Note: the tensor/model runner path now uses Burn (`Dispatch` backend with CPU/ROCm devices).
-The full paged-attention + rotary path is still being refined in follow-up optimization phases.
+Notes:
+- The tensor and model runner path now uses Burn with the `Dispatch` backend on CPU and ROCm devices.
+- Full paged attention and the rotary path are still being refined in later optimization stages.
+
+## Chat REPL
+
+Start an interactive multi-turn chat session with an optional system prompt:
+
+```bash
+cargo run --release -- repl --device cpu --model ./models/Qwen3-0.6B --system "You are a concise assistant."
+```
+
+Built-in REPL commands:
+- `/history`: print the current conversation history
+- `/clear`: clear the conversation history and keep the `--system` prompt
+- `/exit`: leave the REPL
 
 ## Benchmark
 
 Use the built-in `bench` subcommand to measure both latency and throughput with structured CSV-like output:
 
 ```bash
-cargo run --release -- bench --model ./models/Qwen3-0.6B --device cpu --prompt "Hello" --greedy --warmup 1 --iters 5 --max-tokens 128
+cargo run --release -- bench --model ./models/Qwen3-0.6B --device cpu --prompt "Hello" \
+--greedy --warmup 1 --iters 5 --max-tokens 128
 ```
 
 Output columns:
@@ -47,9 +67,9 @@ Recommended benchmark protocol:
 3. Sweep `--repeat-prompt` (e.g. `1, 2, 4, 8`) to evaluate batching/concurrency scaling.
 4. Keep prompt and `--max-tokens` fixed when comparing CPU/ROCm or different commits.
 
-## Weight Conversion Planning
+## Weight Conversion
 
-Generate a deterministic Qwen3 remap/concat plan from HuggingFace safetensors:
+Generate a deterministic Qwen3 remap/concatenation plan from HuggingFace `safetensors` weights:
 
 ```bash
 cargo run --release -- convert-model --model ./models/Qwen3-0.6B --out ./models/Qwen3-0.6B/weights-map.json
